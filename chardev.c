@@ -28,6 +28,9 @@
  * @date   March, 2021
  * @brief  A humble character device
  */
+
+#define pr_fmt(fmt) "chardev: " fmt
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -52,6 +55,10 @@
 #define PRIORITY_RT      1
 #define PRIORITY_RT_LOW  2
 #define PRIORITY_NORMAL  3
+
+#define CLASS_NAME    "evaluation"
+#define DEVICE_NAME   "critical"
+#define MINOR_NUM     0
 
 /* Configurable */
 //#define INFINITE_TEST_LOOP
@@ -98,6 +105,32 @@ enum kthread_lifecycle {
     KTHREAD_STAT_DEAD,
 };
 
+enum execution_status {
+    EXEC_STAT_NOK_WITH_TIMEOUT = -2,
+    EXEC_STAT_NOK,
+    EXEC_STAT_OK,
+    EXEC_STAT_BUSY
+};
+
+struct chardev_context {
+    struct cdev cdev;
+    struct device dev;
+    size_t retry;
+    dev_t major_num;
+    struct exec_metrics {
+        enum execution_status last_result;
+        size_t total_exec_req; /* Total number of execution requests */
+        size_t total_ok; /* Total number of successful execution launches */
+        size_t total_nok_w_timeout; /* Total number of failures detected with timeout occurred ( <= total_exec_req - total_ok) */
+    } metrics;
+};
+
+struct file_priv {
+    struct chardev_context *ctx;
+    struct work_struct async_work; /* This is necessary to implement the workqueue */
+    wait_queue_head_t async_wait; /* This is necessary to implement file_operations->poll() */
+};
+
 typedef struct {
     struct task_struct *task;
     volatile enum kthread_lifecycle lifecycle;
@@ -114,6 +147,7 @@ static int g_total_swi_nok_count;
 static int g_total_worker_timeout_count;
 static int g_total_blocker_timeout_count;
 #endif
+static struct chardev_context *g_ctx;
 
 static void sched_set_mode_critical (struct task_struct *task)
 {
@@ -144,13 +178,13 @@ static int blocker_thread (void *unused)
     local_cpu = smp_processor_id ();
 
     if (local_cpu == WORKER_CPU_CORE_INDEX) {
-        printk (KERN_ERR "[%d] blocker_thread is running on the wrong core\n", local_cpu);
+        pr_err ("[%d] blocker_thread is running on the wrong core\n", local_cpu);
         goto exit;
     }
 
     local_ctx = &g_cpu_contexts[local_cpu];
 
-    printk (KERN_INFO "[%d] blocker_thread is running\n", local_cpu);
+    pr_info ("[%d] blocker_thread is running\n", local_cpu);
 
     msleep (KTHREAD_SETTLE_TIME_MS);
 
@@ -203,7 +237,7 @@ static int blocker_thread (void *unused)
         /* Critical section ends */
 
         if (!timeout) {
-            printk (KERN_INFO "[%d] The blocker_thread timed out while waiting for the worker_thread to end\n", smp_processor_id ());
+            pr_info ("[%d] The blocker_thread timed out while waiting for the worker_thread to end\n", smp_processor_id ());
 #ifdef INFINITE_TEST_LOOP
             g_total_blocker_timeout_count++;
 #endif
@@ -232,7 +266,7 @@ exit:
     }
 #endif
 
-    printk (KERN_INFO "[%d] blocker_thread exiting. Accumulated execution count is %d\n", smp_processor_id (), local_ctx->exec_count);
+    pr_info ("[%d] blocker_thread exiting. Accumulated execution count is %d\n", smp_processor_id (), local_ctx->exec_count);
 
     return 0;
 }
@@ -250,13 +284,13 @@ static int worker_thread (void *unused)
     local_cpu = smp_processor_id ();
 
     if (local_cpu != WORKER_CPU_CORE_INDEX) {
-        printk (KERN_ERR "[%d] worker_thread is running on the wrong core\n", local_cpu);
+        pr_err ("[%d] worker_thread is running on the wrong core\n", local_cpu);
         goto exit;
     }
 
     local_ctx = &g_cpu_contexts[local_cpu];
 
-    printk (KERN_INFO "[%d] worker_thread is running\n", local_cpu);
+    pr_info ("[%d] worker_thread is running\n", local_cpu);
 
     do {
         /* Wait for blocker threads to become ready */
@@ -353,7 +387,7 @@ exit_cri:
         /* Critical section ends */
 
         if (!timeout) {
-            printk (KERN_INFO "[%d] The worker_thread timed out while waiting for the blocker_thread (%d) to start\n", local_cpu, i);
+            pr_info ("[%d] The worker_thread timed out while waiting for the blocker_thread (%d) to start\n", local_cpu, i);
 
 #ifdef INFINITE_TEST_LOOP
             g_total_worker_timeout_count++;
@@ -363,18 +397,18 @@ exit_cri:
         if (ret != 0) {
 #ifdef INFINITE_TEST_LOOP
             g_total_swi_nok_count++;
-            printk (KERN_INFO "[%d] worker_thread execution has failed (ok = %d, nok = %d, worker timeout = %d, blocker timeout = %d).\n",
+            pr_info ("[%d] worker_thread execution has failed (ok = %d, nok = %d, worker timeout = %d, blocker timeout = %d).\n",
                     local_cpu, g_total_swi_ok_count, g_total_swi_nok_count, g_total_worker_timeout_count, g_total_blocker_timeout_count);
 #else
-            printk (KERN_INFO "[%d] worker_thread execution has failed.\n", local_cpu);
+            pr_info ("[%d] worker_thread execution has failed.\n", local_cpu);
 #endif
         } else {
 #ifdef INFINITE_TEST_LOOP
             g_total_swi_ok_count++;
-            printk (KERN_INFO "[%d] worker_thread execution has passed (ok = %d, nok = %d, worker timeout = %d, blocker timeout = %d).\n",
+            pr_info ("[%d] worker_thread execution has passed (ok = %d, nok = %d, worker timeout = %d, blocker timeout = %d).\n",
                     local_cpu, g_total_swi_ok_count, g_total_swi_nok_count, g_total_worker_timeout_count, g_total_blocker_timeout_count);
 #else
-            printk (KERN_INFO "[%d] worker_thread execution has passed.\n", local_cpu);
+            pr_info ("[%d] worker_thread execution has passed.\n", local_cpu);
 #endif
         }
 
@@ -418,7 +452,7 @@ exit:
     }
 #endif
 
-    printk (KERN_INFO "[%d] worker_thread exiting. Accumulated execution count is %d\n", local_cpu, local_ctx->exec_count);
+    pr_info ("[%d] worker_thread exiting. Accumulated execution count is %d\n", local_cpu, local_ctx->exec_count);
 
     return 0;
 }
@@ -433,14 +467,14 @@ static int spawner (void)
         g_cpu_count++;
     }
 
-    printk (KERN_INFO "[%d] spawner is running\n", smp_processor_id ());
+    pr_info ("[%d] spawner is running\n", smp_processor_id ());
 
     if (g_cpu_count < 2) {
-        printk (KERN_ERR "spawner cannot proceed due to insufficient CPU cores\n");
+        pr_err ("spawner cannot proceed due to insufficient CPU cores\n");
         return 0;
     }
 
-    printk (KERN_INFO "[%d] total CPU count: %d\n", smp_processor_id (), g_cpu_count);
+    pr_info ("[%d] total CPU count: %d\n", smp_processor_id (), g_cpu_count);
 
 #ifdef INFINITE_TEST_LOOP
     g_total_swi_ok_count = 0;
@@ -452,7 +486,7 @@ static int spawner (void)
     g_cpu_contexts = kzalloc (sizeof (cpu_context_struct) * g_cpu_count, GFP_KERNEL);
 
     if (g_cpu_contexts == NULL) {
-        printk (KERN_ERR "spawner kmalloc has failed\n");
+        pr_err ("spawner kmalloc has failed\n");
         return 0;
     }
 
@@ -474,11 +508,11 @@ static int spawner (void)
         }
 
         if (IS_ERR_OR_NULL (ctx->task)) {
-            printk (KERN_ERR "spawner kthread_create(worker_thread/blocker_thread) has failed, exiting spawner...\n");
+            pr_err ("spawner kthread_create(worker_thread/blocker_thread) has failed, exiting spawner...\n");
             return 0;
         }
 
-        printk (KERN_INFO "[%d] Created a worker/blocker kthread and bound it to the cpu %d, scheduling policy %d\n", smp_processor_id (), cpu_id, ctx->task->policy);
+        pr_info ("[%d] Created a worker/blocker kthread and bound it to the cpu %d, scheduling policy %d\n", smp_processor_id (), cpu_id, ctx->task->policy);
 
         kthread_bind (ctx->task, cpu_id);
 
@@ -496,15 +530,88 @@ static int spawner (void)
     return 0;
 }
 
+const struct file_operations chardev_fops = {
+    .owner = THIS_MODULE,
+    .llseek = NULL,
+    .open = NULL,
+    .read = NULL,
+    .write = NULL,
+    .poll = NULL,
+    .release = NULL,
+};
+
 static int __init chardev_init (void)
 {
-    printk (KERN_INFO "[%d] chardev_init is running\n", smp_processor_id ());
+    int rc;
+    void *priv_data = NULL; /* Device private data */
+    struct class *class;
 
-    spawner ();
+    pr_info ("[%d] chardev_init is running\n", smp_processor_id ());
 
-    printk (KERN_INFO "[%d] chardev_init exiting\n", smp_processor_id ());
+    g_ctx = kzalloc (sizeof (*g_ctx), GFP_KERNEL);
+    if (g_ctx == NULL) {
+        rc = -ENOMEM;
+        goto out;
+    }
 
+    /* Allocate a major number dynamically */
+    rc = alloc_chrdev_region (&g_ctx->major_num, 0, 1, DEVICE_NAME);
+    if (rc < 0) {
+        pr_err("chardev: failed to allocate major number\n");
+        goto out;
+    }
+
+    /* Initialize a cdev structure */
+    cdev_init (&g_ctx->cdev, &chardev_fops);
+    g_ctx->cdev.owner = THIS_MODULE;
+
+    /* Initialize a device structure */
+    device_initialize (&g_ctx->dev);
+
+    /* Initialize a class structure */
+    class = class_create (THIS_MODULE, CLASS_NAME);
+    if (IS_ERR(class)) {
+        pr_err("chardev: couldn't create device class\n");
+        rc = PTR_ERR(class);
+        goto out_put_device;
+    }
+
+    g_ctx->dev.class = class;
+    //g_ctx->dev.class->shutdown_pre = NULL;
+    //g_ctx->dev.release = NULL;
+    //g_ctx->dev.parent = NULL;
+    //g_ctx->dev.groups = NULL; /* sysfs attribute_group */
+
+    g_ctx->dev.devt = MKDEV(MAJOR(g_ctx->major_num), MINOR_NUM);
+
+    rc = dev_set_name(&g_ctx->dev, "%s%d", DEVICE_NAME, MINOR_NUM);
+    if (rc) {
+        goto out_destroy_class;
+    }
+
+    dev_set_drvdata (&g_ctx->dev, priv_data);
+
+    /* Create a char device */
+    rc = cdev_device_add (&g_ctx->cdev, &g_ctx->dev);
+    if (rc) {
+        dev_err (&g_ctx->dev,
+            "unable to cdev_device_add() %s, major %d, minor %d, err=%d\n",
+            dev_name (&g_ctx->dev), MAJOR (g_ctx->dev.devt),
+            MINOR (g_ctx->dev.devt), rc);
+        goto out_destroy_class;
+    }
+
+    pr_info ("[%d] chardev_init exiting\n", smp_processor_id ());
     return 0;
+
+out_destroy_class:
+    class_destroy (class);
+out_put_device:
+    put_device (&g_ctx->dev);
+out_unreg_chardev:
+    unregister_chrdev_region (g_ctx->major_num , 1);
+out:
+    return rc;
 }
 
 static void __exit chardev_exit (void)
@@ -512,8 +619,9 @@ static void __exit chardev_exit (void)
     int cpu_id = 0;
     cpu_context_struct *ctx;
 
-    printk (KERN_INFO "[%d] chardev_exit is running\n", smp_processor_id ());
+    pr_info ("[%d] chardev_exit is running\n", smp_processor_id ());
 
+#if 0
 #ifdef INFINITE_TEST_LOOP
     for(cpu_id = 0; cpu_id < g_cpu_count; cpu_id++) {
         if (!IS_ERR_OR_NULL (g_cpu_contexts[cpu_id].task)) {
@@ -529,7 +637,12 @@ static void __exit chardev_exit (void)
     }
 
     kfree (g_cpu_contexts);
-    printk (KERN_INFO "[%d] chardev_exit exiting\n", smp_processor_id());
+#else
+    cdev_device_del (&g_ctx->cdev, &g_ctx->dev);
+    unregister_chrdev_region (g_ctx->major_num , 1);
+    class_destroy (g_ctx->dev.class);
+#endif
+    pr_info ("[%d] chardev_exit exiting\n", smp_processor_id());
 }
 
 module_init(chardev_init);
