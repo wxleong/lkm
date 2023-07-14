@@ -50,44 +50,37 @@
 #include <linux/sched.h>
 #include <linux/wait.h>
 
+#include "operator.h"
+
 /* Constants */
 #define CLASS_NAME    "evaluation"
 #define DEVICE_NAME   "critical"
 #define MINOR_NUM     0 /* Device major number is dynamically assigned */
 
-/* kthread context */
-/*struct kthread_context {
-    struct task_struct *task;
-    volatile enum kthread_lifecycle lifecycle;
-    size_t exec_count;
-};*/
-
 /* Global context */
-struct global_context {
+struct glob_context {
     struct cdev cdev;
     struct device dev;
     dev_t major_num;
 
-    //struct kthread_context *kt_worker;
-    //struct kthread_context **kt_blockers;
-    
+    struct glob_op_context *op_ctx;
 };
 
 /* Session Context */
 struct session_context {
-    struct global_context *ctx;
+    struct glob_context *ctx;
 
-
+    struct session_op_context *op_ctx;
 };
 
-static struct global_context *g_ctx;
+static struct glob_context *g_ctx;
 
 static int fops_open (struct inode *inode, struct file *file)
 {
-    struct global_context *ctx;
+    struct glob_context *ctx;
     struct session_context *priv;
 
-    ctx = container_of(inode->i_cdev, struct global_context, cdev);
+    ctx = container_of(inode->i_cdev, struct glob_context, cdev);
 
     priv = kzalloc (sizeof (*priv), GFP_KERNEL);
     if (priv == NULL) {
@@ -202,6 +195,12 @@ static int __init chardev_init (void)
         goto out_destroy_class;
     }
 
+    /* Initialize operator */
+    rc = op_init (&g_ctx->op_ctx);
+    if (rc) {
+        goto out_destroy_class;
+    }
+
     pr_info ("[%d] chardev_init exiting\n", smp_processor_id ());
     return 0;
 
@@ -218,6 +217,10 @@ static void __exit chardev_exit (void)
 {
     pr_info ("[%d] chardev_exit is running\n", smp_processor_id ());
 
+    /* Release operator */
+    op_exit (g_ctx->op_ctx);
+
+    /* Release the char device and its associated resources */
     cdev_device_del (&g_ctx->cdev, &g_ctx->dev);
     unregister_chrdev_region (g_ctx->major_num , 1);
     class_destroy (g_ctx->dev.class);

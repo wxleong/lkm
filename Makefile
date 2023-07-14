@@ -1,6 +1,6 @@
 obj-m = lkm.o
 lkm-objs := chardev.o
-lkm-objs += hogger.o
+lkm-objs += operator.o
 
 ccflags-y := -std=gnu99 -Wno-vla
 
