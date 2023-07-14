@@ -25,7 +25,7 @@
  ***************************************************************************************/
 /**
  * @file   chardev.c
- * @date   March, 2021
+ * @date   July, 2023
  * @brief  A humble character device
  */
 
@@ -53,23 +53,54 @@
 /* Constants */
 #define CLASS_NAME    "evaluation"
 #define DEVICE_NAME   "critical"
-#define MINOR_NUM     0
+#define MINOR_NUM     0 /* Device major number is dynamically assigned */
 
-struct chardev_context {
+/* kthread context */
+/*struct kthread_context {
+    struct task_struct *task;
+    volatile enum kthread_lifecycle lifecycle;
+    size_t exec_count;
+};*/
+
+/* Global context */
+struct global_context {
     struct cdev cdev;
     struct device dev;
     dev_t major_num;
+
+    //struct kthread_context *kt_worker;
+    //struct kthread_context **kt_blockers;
+    
 };
 
-struct file_priv {
-    struct chardev_context *ctx;
+/* Session Context */
+struct session_context {
+    struct global_context *ctx;
+
+
 };
 
-static struct chardev_context *g_ctx;
+static struct global_context *g_ctx;
 
 static int fops_open (struct inode *inode, struct file *file)
 {
+    struct global_context *ctx;
+    struct session_context *priv;
+
+    ctx = container_of(inode->i_cdev, struct global_context, cdev);
+
+    priv = kzalloc (sizeof (*priv), GFP_KERNEL);
+    if (priv == NULL) {
+        goto out;
+    }
+
+    priv->ctx = ctx;
+    file->private_data = priv;
+
     return 0;
+
+out:
+    return -ENOMEM;
 }
 
 static ssize_t fops_read (struct file *, char __user *, size_t, loff_t *)
@@ -94,6 +125,10 @@ static __poll_t fops_poll (struct file *, struct poll_table_struct *)
 
 static int fops_release (struct inode *inode, struct file *file)
 {
+    struct session_context *priv = file->private_data;
+
+    kfree(priv);
+
     return 0;
 }
 
@@ -174,7 +209,6 @@ out_destroy_class:
     class_destroy (class);
 out_put_device:
     put_device (&g_ctx->dev);
-out_unreg_chardev:
     unregister_chrdev_region (g_ctx->major_num , 1);
 out:
     return rc;

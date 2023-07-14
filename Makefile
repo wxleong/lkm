@@ -1,4 +1,7 @@
-obj-m = chardev.o
+obj-m = lkm.o
+lkm-objs := chardev.o
+lkm-objs += hogger.o
+
 ccflags-y := -std=gnu99 -Wno-vla
 
 all:
