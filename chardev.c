@@ -51,10 +51,11 @@
 #include <linux/wait.h>
 
 #include "operator.h"
+#include "chardev.h"
 
 /* Constants */
-#define CLASS_NAME    "evaluation"
-#define DEVICE_NAME   "critical"
+#define CLASS_NAME    "eval"
+#define DEVICE_NAME   "op"
 #define MINOR_NUM     0 /* Device major number is dynamically assigned */
 
 /* Global context */
@@ -63,62 +64,68 @@ struct glob_context {
     struct device dev;
     dev_t major_num;
 
-    struct glob_op_context *op_ctx;
+    struct op_glob_context *op_g_ctx;
 };
 
 /* Session Context */
 struct session_context {
-    struct glob_context *ctx;
-
-    struct session_op_context *op_ctx;
+    struct op_session_context *op_s_ctx;
 };
 
 static struct glob_context *g_ctx;
 
 static int fops_open (struct inode *inode, struct file *file)
 {
-    struct glob_context *ctx;
+    struct glob_context *glob_ctx;
     struct session_context *priv;
 
-    ctx = container_of(inode->i_cdev, struct glob_context, cdev);
+    glob_ctx = container_of(inode->i_cdev, struct glob_context, cdev);
 
     priv = kzalloc (sizeof (*priv), GFP_KERNEL);
     if (priv == NULL) {
         goto out;
     }
 
-    priv->ctx = ctx;
+    priv->op_s_ctx = op_fops_open (glob_ctx->op_g_ctx);
+    if (!priv->op_s_ctx) {
+        goto out_free_priv;
+    }
+
     file->private_data = priv;
 
     return 0;
 
+out_free_priv:
+    kfree (priv);
 out:
     return -ENOMEM;
 }
 
-static ssize_t fops_read (struct file *, char __user *, size_t, loff_t *)
+static ssize_t fops_read (struct file *file, char __user *buf, size_t size, loff_t *off)
 {
-    return 0;
+    struct session_context *priv = file->private_data;
+
+    return op_fops_read (priv->op_s_ctx, file, buf, size, off);
 }
 
 static ssize_t fops_write (struct file *, const char __user *, size_t, loff_t *)
 {
+    /* Not supported */
     return 0;
 }
 
-static __poll_t fops_poll (struct file *, struct poll_table_struct *)
+static __poll_t fops_poll (struct file *file, struct poll_table_struct *poll_table)
 {
-    __poll_t mask = 0;
+    struct session_context *priv = file->private_data;
 
-    /* mask = EPOLLIN | EPOLLRDNORM; */ /* Indicates fd is ready for reading */
-    /* mask = EPOLLOUT | EPOLLWRNORM; */ /* Indicates fd is ready for writing */
-
-    return mask;
+    return op_fops_poll (priv->op_s_ctx, file, poll_table);
 }
 
 static int fops_release (struct inode *inode, struct file *file)
 {
     struct session_context *priv = file->private_data;
+
+    op_fops_release (priv->op_s_ctx);
 
     kfree(priv);
 
@@ -196,7 +203,7 @@ static int __init chardev_init (void)
     }
 
     /* Initialize operator */
-    rc = op_init (&g_ctx->op_ctx);
+    rc = op_init (&g_ctx->op_g_ctx);
     if (rc) {
         goto out_destroy_class;
     }
@@ -218,7 +225,7 @@ static void __exit chardev_exit (void)
     pr_info ("[%d] chardev_exit is running\n", smp_processor_id ());
 
     /* Release operator */
-    op_exit (g_ctx->op_ctx);
+    op_exit (g_ctx->op_g_ctx);
 
     /* Release the char device and its associated resources */
     cdev_device_del (&g_ctx->cdev, &g_ctx->dev);

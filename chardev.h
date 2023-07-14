@@ -24,13 +24,33 @@
  *                                                                                     *
  ***************************************************************************************/
 /**
- * @file   operator.h
+ * @file   chardev.h
  * @date   July, 2023
  * @brief  Header file
  */
-#ifndef __OPERATOR_H__
-#define __OPERATOR_H__
+#ifndef __CHARDEV_H__
+#define __CHARDEV_H__
 
-#include "chardev.h"
+/* Global operation context */
+struct op_glob_context;
+
+/* Session operation context */
+struct op_session_context;
+
+extern int
+op_init (struct op_glob_context **);
+extern void
+op_exit (struct op_glob_context *);
+
+extern struct op_session_context *
+op_fops_open (struct op_glob_context *);
+extern ssize_t
+op_fops_read (struct op_session_context *,
+              struct file *, char *, size_t, loff_t *);
+__poll_t
+op_fops_poll (struct op_session_context *,
+              struct file *, struct poll_table_struct *);
+extern int
+op_fops_release (struct op_session_context *);
 
 #endif

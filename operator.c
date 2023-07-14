@@ -50,7 +50,8 @@
 #include <linux/interrupt.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
-
+#include <linux/poll.h>
+#include <linux/uaccess.h>
 #include "operator.h"
 
 /* Constants */
@@ -59,13 +60,7 @@
 #define PRIORITY_RT_LOW  2
 #define PRIORITY_NORMAL  3
 
-#define CLASS_NAME    "evaluation"
-#define DEVICE_NAME   "critical"
-#define MINOR_NUM     0
-
 /* Configurable */
-//#define INFINITE_TEST_LOOP
-//#define WORKER_EXIT_ON_TIMEOUT
 #define WORKER_CPU_CORE_INDEX   0
 #define WORKER_BUSYWAIT_TIMEOUT_US       1000000
 /**
@@ -104,12 +99,12 @@ enum kthread_lifecycle {
     KTHREAD_STAT_READY,
     KTHREAD_REQ_START,
     KTHREAD_STAT_RUNNING,
-    KTHREAD_REQ_EXIT,
+    KTHREAD_STAT_COMPLETED,
     KTHREAD_STAT_DEAD,
 };
 
 enum execution_status {
-    EXEC_STAT_NOK_WITH_TIMEOUT = -2,
+    EXEC_STAT_NOK_WITH_TIMEOUT = 0,
     EXEC_STAT_NOK,
     EXEC_STAT_OK,
     EXEC_STAT_BUSY
@@ -119,31 +114,40 @@ enum execution_status {
 struct kthread_context {
     struct task_struct *task;
     volatile enum kthread_lifecycle lifecycle;
-    int exec_count;
+
+    int exec_count; /* Total execution count */
+    int exec_ok_count; /* Total sucessful execution count (only meaningful on worker_thread) */
+    int timeout_count; /* Total timeout count:
+                          - On worker_thread, timeout waiting for the blocker to enter blocking mode.
+                          - On blocker_thread, timeout waiting for the worker to complete its execution. */
 };
 
 /* Global operation context */
-struct glob_op_context {
+struct op_glob_context {
     struct kthread_context *kt_ctx;
     int cpu_count;
     volatile bool is_busy;
-    wait_queue_head_t wq;
+
+    wait_queue_head_t worker_waitq; /* A waitqueue for worker_thread to wait on */
+    wait_queue_head_t blocker_waitq; /* A waitqueue for blocker_thread to wait on */
+    wait_queue_head_t workq_waitq; /* A waitqueue for workqueue's workers to wait on */
+
+    struct workqueue_struct *workq;
+    atomic_t workq_counter; /* To keep track of active workers */
 
     bool is_calibrated; /* Measure the total time required to hog all CPU cores */
     int worker_timeout; /* Specify the timeout value for waiting for the blocker to enter blocking mode */
     int blocker_timeout; /* Specify the timeout value for waiting for the worker to complete its execution */
-
-#ifdef INFINITE_TEST_LOOP
-    int exec_ok_count;
-    int exec_nok_count;
-    int worker_timeout_count;
-    int blocker_timeout_count;
-#endif
 };
 
 /* Session operation context */
 struct op_session_context {
-
+    struct op_glob_context *parent;
+    struct work_struct work;
+    struct mutex mutex; /* For implementation of mutex-based access control to fops */
+    wait_queue_head_t async_waitq; /* For implementation of fops polling */
+    bool fops_is_busy;
+    char response;
 };
 
 
@@ -171,7 +175,7 @@ static int blocker_thread (void *data)
     int timeout;
     int local_cpu;
     unsigned long flags;
-    struct glob_op_context *op_ctx = (struct glob_op_context *)data;
+    struct op_glob_context *op_ctx = (struct op_glob_context *)data;
     struct kthread_context *local_ctx;
 
     local_cpu = smp_processor_id ();
@@ -185,7 +189,8 @@ static int blocker_thread (void *data)
 
     pr_info ("[%d] blocker_thread is running\n", local_cpu);
 
-    msleep (KTHREAD_SETTLE_TIME_MS);
+    /* ?? */
+    //msleep (KTHREAD_SETTLE_TIME_MS);
 
     do {
         /* Reset blocker parameters */
@@ -194,12 +199,12 @@ static int blocker_thread (void *data)
         /* Indicate to worker_thread that blocker_thread is ready for action */
         local_ctx->lifecycle = KTHREAD_STAT_READY;
         smp_wmb ();
-        wake_up_all (&op_ctx->wq);
+        wake_up_all (&op_ctx->worker_waitq);
 
         /* Wait for start command from worker_thread */
-        wait_event_cmd (op_ctx->wq,
+        wait_event_cmd (op_ctx->blocker_waitq,
                         (local_ctx->lifecycle == KTHREAD_REQ_START) ||
-                        (local_ctx->lifecycle == KTHREAD_REQ_EXIT),,
+                        kthread_should_stop (),,
                         smp_rmb ());
 
         if (local_ctx->lifecycle != KTHREAD_REQ_START ||
@@ -225,44 +230,35 @@ static int blocker_thread (void *data)
                 udelay (1);
             }
 
-            local_ctx->exec_count++;
-
             local_irq_restore (flags);
             preempt_enable ();
         }
         /* Critical section ends */
 
+        local_ctx->exec_count++;
+
         if (!timeout) {
-            pr_info ("[%d] The blocker_thread timed out while waiting for the worker_thread to end\n", smp_processor_id ());
-#ifdef INFINITE_TEST_LOOP
-            op_ctx->blocker_timeout_count++;
-#endif
+            local_ctx->timeout_count++;
+            pr_info ("[cpu-%d] The blocker_thread timed out while waiting for the worker_thread to end\n", local_cpu);
         }
 
-#ifdef INFINITE_TEST_LOOP
+        pr_info ("[cpu-%d] blocker_thread status (total = %d, timeout = %d).\n",
+                local_cpu, local_ctx->exec_count, local_ctx->timeout_count);
 
-        msleep(TEST_LOOP_DELAY_MS);
     } while (!kthread_should_stop ());
-#else
-    } while (0);
-#endif
-
 
 exit:
 
     sched_set_mode_exit (current);
 
     local_ctx->lifecycle = KTHREAD_STAT_DEAD;
-    smp_wmb ();
-    wake_up_all (&op_ctx->wq);
 
-#ifdef INFINITE_TEST_LOOP
+    /* Graciously exit */
     while (!kthread_should_stop ()) {
         yield ();
     }
-#endif
 
-    pr_info ("[%d] blocker_thread exiting. Accumulated execution count is %d\n", smp_processor_id (), local_ctx->exec_count);
+    pr_info ("[cpu-%d] blocker_thread exiting.\n", local_cpu);
 
     return 0;
 }
@@ -274,20 +270,20 @@ static int worker_thread (void *data)
     int i;
     uint16_t ret = -1;
     unsigned long flags;
-    struct glob_op_context *op_ctx = (struct glob_op_context *)data;
+    struct op_glob_context *op_ctx = (struct op_glob_context *)data;
     struct kthread_context *blocker_ctx;
     struct kthread_context *local_ctx;
 
     local_cpu = smp_processor_id ();
 
     if (local_cpu != WORKER_CPU_CORE_INDEX) {
-        pr_err ("[%d] worker_thread is running on the wrong core\n", local_cpu);
+        pr_err ("[cpu-%d] worker_thread is running on the wrong core\n", local_cpu);
         goto exit;
     }
 
     local_ctx = &op_ctx->kt_ctx[local_cpu];
 
-    pr_info ("[%d] worker_thread is running\n", local_cpu);
+    pr_info ("[cpu-%d] worker_thread is running\n", local_cpu);
 
     do {
         /* Wait for blocker threads to become ready */
@@ -298,9 +294,10 @@ static int worker_thread (void *data)
 
             blocker_ctx = &op_ctx->kt_ctx[i];
 
-            wait_event_cmd (op_ctx->wq,
+            wait_event_cmd (op_ctx->worker_waitq,
                             (blocker_ctx->lifecycle == KTHREAD_STAT_READY) ||
-                            (blocker_ctx->lifecycle == KTHREAD_STAT_DEAD),,
+                            (blocker_ctx->lifecycle == KTHREAD_STAT_DEAD) ||
+                            kthread_should_stop (),,
                             smp_rmb ());
 
             if (blocker_ctx->lifecycle != KTHREAD_STAT_READY ||
@@ -308,17 +305,21 @@ static int worker_thread (void *data)
                 goto exit;
             }
         }
-
+        local_ctx->lifecycle = KTHREAD_STAT_READY;
 
         /* Wait for user request */
-        /* TO-BE-IMPLEMENTED */
+        wait_event_cmd (op_ctx->worker_waitq,
+                        atomic_read (&op_ctx->workq_counter) ||
+                        kthread_should_stop (),,
+                        smp_rmb ());
+        if (kthread_should_stop ()) {
+            goto exit;
+        }
 
         /* Reset worker parameters */
+        local_ctx->lifecycle = KTHREAD_STAT_RUNNING;
         timeout = WORKER_BUSYWAIT_TIMEOUT_US;
         op_ctx->is_busy = true;
-        local_ctx->lifecycle = KTHREAD_STAT_READY;
-        smp_wmb ();
-        wake_up_all (&op_ctx->wq);
         local_ctx->exec_count++;
 
         /* Issue start command to blocker threads */
@@ -329,9 +330,8 @@ static int worker_thread (void *data)
 
             blocker_ctx = &op_ctx->kt_ctx[i];
             blocker_ctx->lifecycle = KTHREAD_REQ_START;
-            smp_wmb ();
         }
-        wake_up_all (&op_ctx->wq);
+        wake_up_all (&op_ctx->blocker_waitq);
 
         /* Critical section begins */
         {
@@ -356,11 +356,7 @@ static int worker_thread (void *data)
                 } while (--timeout);
 
                 if (!timeout) {
-#ifdef WORKER_EXIT_ON_TIMEOUT
-                    goto exit_cri;
-#else
                     break;
-#endif
                 }
             }
 
@@ -376,9 +372,6 @@ static int worker_thread (void *data)
 
             /* The computation logic ends here */
 
-#ifdef WORKER_EXIT_ON_TIMEOUT
-exit_cri:
-#endif
             op_ctx->is_busy = false;
             smp_wmb ();
 
@@ -388,124 +381,88 @@ exit_cri:
         /* Critical section ends */
 
         if (!timeout) {
-#ifdef INFINITE_TEST_LOOP
-            op_ctx->worker_timeout_count++;
-#endif
-            pr_info ("[%d] The worker_thread timed out while waiting for the blocker_thread (%d) to start\n", local_cpu, i);
+            local_ctx->timeout_count++;
+            pr_info ("[cpu-%d] The worker_thread timed out while waiting for the blocker_thread (cpu-%d) to start\n", local_cpu, i);
         }
 
         if (ret != 0) {
-#ifdef INFINITE_TEST_LOOP
-            op_ctx->exec_nok_count++;
-            pr_info ("[%d] worker_thread execution has failed (ok = %d, nok = %d, worker timeout = %d, blocker timeout = %d).\n",
-                    local_cpu, op_ctx->exec_ok_count, op_ctx->exec_nok_count, op_ctx->worker_timeout_count, op_ctx->blocker_timeout_count);
-#else
-            pr_info ("[%d] worker_thread execution has failed.\n", local_cpu);
-#endif
+            pr_info ("[cpu-%d] worker_thread execution has failed (total = %d, ok = %d, timeout = %d).\n",
+                    local_cpu, local_ctx->exec_count, local_ctx->exec_ok_count, local_ctx->timeout_count);
         } else {
-#ifdef INFINITE_TEST_LOOP
-            op_ctx->exec_ok_count++;
-            pr_info ("[%d] worker_thread execution has passed (ok = %d, nok = %d, worker timeout = %d, blocker timeout = %d).\n",
-                    local_cpu, op_ctx->exec_ok_count, op_ctx->exec_nok_count, op_ctx->worker_timeout_count, op_ctx->blocker_timeout_count);
-#else
-            pr_info ("[%d] worker_thread execution has passed.\n", local_cpu);
-#endif
+            local_ctx->exec_ok_count++;
+            pr_info ("[cpu-%d] worker_thread execution has passed (total = %d, ok = %d, timeout = %d).\n",
+                    local_cpu, local_ctx->exec_count, local_ctx->exec_ok_count, local_ctx->timeout_count);
         }
 
-#ifdef INFINITE_TEST_LOOP
+        /* Service all requests (work_handler) */
+        local_ctx->lifecycle = KTHREAD_STAT_COMPLETED;
+        wake_up_all (&op_ctx->workq_waitq);
+
     } while (!kthread_should_stop ());
-#else
-    } while (0);
-#endif
 
 exit:
 
     sched_set_mode_exit (current);
 
-    /* Notify blocker_thread to exit */
-    for (i = 0; i < op_ctx->cpu_count; i++) {
-        if (i == WORKER_CPU_CORE_INDEX) {
-            continue;
-        }
-
-        blocker_ctx = &op_ctx->kt_ctx[i];
-
-        wait_event_cmd (op_ctx->wq,
-                        blocker_ctx->lifecycle == KTHREAD_STAT_READY ||
-                        blocker_ctx->lifecycle == KTHREAD_STAT_DEAD,,
-                        smp_rmb ());
-
-        if (blocker_ctx->lifecycle == KTHREAD_STAT_READY) {
-            blocker_ctx->lifecycle = KTHREAD_REQ_EXIT;
-            smp_wmb ();
-            wake_up_all (&op_ctx->wq);
-        }
-    }
-
     local_ctx->lifecycle = KTHREAD_STAT_DEAD;
-    smp_wmb ();
-    wake_up_all (&op_ctx->wq);
 
-#ifdef INFINITE_TEST_LOOP
+    /* Graciously exit */
     while (!kthread_should_stop ()) {
         yield ();
     }
-#endif
 
-    pr_info ("[%d] worker_thread exiting. Accumulated execution count is %d\n", local_cpu, local_ctx->exec_count);
+    pr_info ("[%d] worker_thread exiting.\n", local_cpu);
 
     return 0;
 }
 
-static int spawner (struct glob_op_context *op_ctx)
+static int spawner (struct op_glob_context *op_g_ctx)
 {
     int cpu_id;
     int cpu;
     char string[256] = {0};
 
     for_each_online_cpu (cpu) {
-        op_ctx->cpu_count++;
+        op_g_ctx->cpu_count++;
     }
 
-    op_ctx->cpu_count++;
+    pr_info ("[cpu-%d] spawner is running\n", smp_processor_id ());
 
-    pr_info ("[%d] spawner is running\n", smp_processor_id ());
-
-    if (op_ctx->cpu_count < 2) {
+    if (op_g_ctx->cpu_count < 2) {
         pr_err ("Unable to proceed due to insufficient CPU cores\n");
         return -ENXIO;
     }
 
-    pr_info ("[%d] total CPU count: %d\n", smp_processor_id (), op_ctx->cpu_count);
+    pr_info ("[cpu-%d] total CPU count: %d\n", smp_processor_id (), op_g_ctx->cpu_count);
 
-#ifdef INFINITE_TEST_LOOP
-    op_ctx->exec_ok_count = 0;
-    op_ctx->exec_nok_count = 0;
-    op_ctx->worker_timeout_count = 0;
-    op_ctx->blocker_timeout_count = 0;
-#endif
-
-    op_ctx->kt_ctx = kzalloc (sizeof (*op_ctx->kt_ctx) * op_ctx->cpu_count, GFP_KERNEL);
-    if (op_ctx->kt_ctx == NULL) {
+    op_g_ctx->kt_ctx = kzalloc (sizeof (*op_g_ctx->kt_ctx) * op_g_ctx->cpu_count, GFP_KERNEL);
+    if (!op_g_ctx->kt_ctx) {
         pr_err ("kzalloc has failed\n");
         return -ENOMEM;
     }
 
-    init_waitqueue_head (&op_ctx->wq);
+    init_waitqueue_head (&op_g_ctx->worker_waitq);
+    init_waitqueue_head (&op_g_ctx->blocker_waitq);
+    init_waitqueue_head (&op_g_ctx->workq_waitq);
+
+    op_g_ctx->workq = alloc_workqueue("tpm_dev_wq", WQ_MEM_RECLAIM, 0);
+    if (!op_g_ctx->workq) {
+        return -ENOMEM;
+    }
 
     /* Create and initialize kthreads */
-    for (cpu_id = 0; cpu_id < op_ctx->cpu_count; cpu_id++) {
-        struct kthread_context *kt_ctx = &op_ctx->kt_ctx[cpu_id];
+    for (cpu_id = 0; cpu_id < op_g_ctx->cpu_count; cpu_id++) {
+        struct kthread_context *kt_ctx = &op_g_ctx->kt_ctx[cpu_id];
 
         kt_ctx->lifecycle = KTHREAD_STAT_NULL;
 
         /* We want the spawner_thread and worker_thread to operate on the same core */
         if (cpu_id == WORKER_CPU_CORE_INDEX) {
-            snprintf (string, sizeof(string), "worker_thread (cpu %d)", cpu_id);
-            kt_ctx->task = kthread_create (worker_thread, (void *)op_ctx, string);
+            snprintf (string, sizeof(string), "worker_thread (cpu-%d)", cpu_id);
+            kt_ctx->task = kthread_create (worker_thread, (void *)op_g_ctx, string);
         } else {
-            snprintf (string, sizeof (string), "blocker_thread (cpu %d)", cpu_id);
-            kt_ctx->task = kthread_create (blocker_thread, (void *)op_ctx, string);
+            snprintf (string, sizeof (string), "blocker_thread (cpu-%d)", cpu_id);
+            kt_ctx->task = kthread_create (blocker_thread, (void *)op_g_ctx, string);
         }
 
         if (IS_ERR_OR_NULL (kt_ctx->task)) {
@@ -513,7 +470,7 @@ static int spawner (struct glob_op_context *op_ctx)
             return 0;
         }
 
-        pr_info ("[%d] Created a worker/blocker kthread and bound it to the cpu %d, scheduling policy %d\n", smp_processor_id (), cpu_id, kt_ctx->task->policy);
+        pr_info ("[cpu-%d] Created a worker/blocker kthread and bound it to the cpu-%d, scheduling policy %d\n", smp_processor_id (), cpu_id, kt_ctx->task->policy);
 
         kthread_bind (kt_ctx->task, cpu_id);
 
@@ -522,42 +479,172 @@ static int spawner (struct glob_op_context *op_ctx)
     }
 
     /* Launch kthreads */
-    for (cpu_id = op_ctx->cpu_count - 1; cpu_id >= 0; cpu_id--) {
-        struct kthread_context *kt_ctx = &op_ctx->kt_ctx[cpu_id];
+    for (cpu_id = op_g_ctx->cpu_count - 1; cpu_id >= 0; cpu_id--) {
+        struct kthread_context *kt_ctx = &op_g_ctx->kt_ctx[cpu_id];
         wake_up_process (kt_ctx->task);
     }
 
     return 0;
 }
 
-int op_init (struct glob_op_context **op_ctx)
+static void work_handler (struct work_struct *work)
 {
-    *op_ctx = kzalloc (sizeof (**op_ctx), GFP_KERNEL);
-    if (*op_ctx == NULL) {
+    struct op_session_context *op_s_ctx =
+            container_of(work, struct op_session_context, work);
+    struct op_glob_context *op_g_ctx = op_s_ctx->parent;
+
+    /* Request to start operation */
+    atomic_inc (&op_g_ctx->workq_counter);
+    wake_up_all (&op_g_ctx->worker_waitq);
+
+    /* Wait for the operation */
+    wait_event (op_g_ctx->workq_waitq,
+                op_g_ctx->kt_ctx[WORKER_CPU_CORE_INDEX].lifecycle == KTHREAD_STAT_COMPLETED);
+    atomic_dec (&op_g_ctx->workq_counter);
+
+    mutex_lock (&op_s_ctx->mutex);
+
+    pr_info ("Workqueue: Work handler executed\n");
+
+    op_s_ctx->response = (char)EXEC_STAT_OK;
+    op_s_ctx->fops_is_busy = false;
+
+    mutex_unlock (&op_s_ctx->mutex);
+    wake_up_interruptible (&op_s_ctx->async_waitq);
+}
+
+ssize_t op_fops_read (struct op_session_context *op_s_ctx,
+                      struct file *file, char *buf, size_t size, loff_t *off)
+{
+    struct op_glob_context *op_g_ctx = op_s_ctx->parent;
+    ssize_t ret = 1;
+    int rc;
+
+    mutex_lock (&op_s_ctx->mutex);
+
+    if (op_s_ctx->fops_is_busy) {
+        goto out_busy;
+    }
+
+    op_s_ctx->fops_is_busy = true;
+
+    /* Queue the work to workqueue */
+    queue_work (op_g_ctx->workq, &op_s_ctx->work);
+
+    if (file->f_flags & O_NONBLOCK) {
+        /* O_NONBLOCK */
+        pr_info ("entered O_NONBLOCK\n");
+        goto out_busy;
+    } else {
+        /* ~O_NONBLOCK */
+        pr_info ("entered ~O_NONBLOCK\n");
+
+        mutex_unlock (&op_s_ctx->mutex);
+
+        wait_event_interruptible (op_s_ctx->async_waitq, !op_s_ctx->fops_is_busy);
+
+        mutex_lock (&op_s_ctx->mutex);
+
+        rc = copy_to_user (buf, &op_s_ctx->response, ret);
+        if (rc) {
+            ret = -EFAULT;
+        }
+
+        mutex_unlock (&op_s_ctx->mutex);
+    }
+
+    return ret;
+
+out_busy:
+        op_s_ctx->response = (char)EXEC_STAT_BUSY;
+
+        rc = copy_to_user (buf, &op_s_ctx->response, ret);
+        if (rc) {
+            ret = -EFAULT;
+        }
+
+        mutex_unlock (&op_s_ctx->mutex);
+        return ret;
+}
+
+__poll_t op_fops_poll (struct op_session_context * op_s_ctx,
+                       struct file *file,
+                       struct poll_table_struct *poll_table)
+{
+    __poll_t mask = 0;
+
+    poll_wait (file, &op_s_ctx->async_waitq, poll_table);
+
+    mutex_lock (&op_s_ctx->mutex);
+
+    if (!op_s_ctx->fops_is_busy) {
+        mask = EPOLLIN | EPOLLRDNORM; /* Indicates that there is data available for reading from fd */
+    }
+
+    mutex_unlock (&op_s_ctx->mutex);
+
+    return mask;
+}
+
+struct op_session_context *op_fops_open (struct op_glob_context *op_g_ctx)
+{
+    struct op_session_context *ctx;
+
+    ctx = kzalloc (sizeof (*ctx), GFP_KERNEL);
+    if (ctx) {
+        ctx->parent = op_g_ctx;
+        INIT_WORK (&ctx->work, work_handler);
+        mutex_init (&ctx->mutex);
+        init_waitqueue_head (&ctx->async_waitq);
+    }
+
+    return ctx;
+}
+
+int op_fops_release (struct op_session_context *op_s_ctx)
+{
+    mutex_destroy (&op_s_ctx->mutex);
+    kfree (op_s_ctx);
+
+    return 0;
+}
+
+int op_init (struct op_glob_context **op_g_ctx)
+{
+    *op_g_ctx = kzalloc (sizeof (**op_g_ctx), GFP_KERNEL);
+    if (*op_g_ctx == NULL) {
         return -ENOMEM;
     }
 
-    return spawner (*op_ctx);
+    return spawner (*op_g_ctx);
 }
 
-void op_exit (struct glob_op_context *op_ctx)
+void op_exit (struct op_glob_context *op_ctx)
 {
     int cpu_id;
 
-#ifdef INFINITE_TEST_LOOP
+    /* Issues stop signal to all kthreads */
     for(cpu_id = 0; cpu_id < op_ctx->cpu_count; cpu_id++) {
         struct kthread_context *kt_ctx = &op_ctx->kt_ctx[cpu_id];
         if (!IS_ERR_OR_NULL (kt_ctx->task)) {
             kthread_stop (kt_ctx->task);
         }
     }
-#endif
 
+    /* Wake up all waiting threads */
+    wake_up_all (&op_ctx->worker_waitq);
+    wake_up_all (&op_ctx->blocker_waitq);
+    wake_up_all (&op_ctx->workq_waitq);
+
+    /* Wait for all kthreads to exit */
     for(cpu_id = 0; cpu_id < op_ctx->cpu_count; cpu_id++) {
         struct kthread_context *kt_ctx = &op_ctx->kt_ctx[cpu_id];
-        wait_event (op_ctx->wq,
+        wait_event (op_ctx->blocker_waitq,
                     kt_ctx->lifecycle == KTHREAD_STAT_DEAD);
     }
+
+    flush_workqueue (op_ctx->workq);
+    destroy_workqueue (op_ctx->workq);
 
     kfree (op_ctx->kt_ctx);
     kfree (op_ctx);
