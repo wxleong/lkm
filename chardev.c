@@ -108,10 +108,11 @@ static ssize_t fops_read (struct file *file, char __user *buf, size_t size, loff
     return op_fops_read (priv->op_s_ctx, file, buf, size, off);
 }
 
-static ssize_t fops_write (struct file *, const char __user *, size_t, loff_t *)
+static ssize_t fops_write (struct file *file, const char __user *buf, size_t size, loff_t *off)
 {
-    /* Not supported */
-    return 0;
+    struct session_context *priv = file->private_data;
+
+    return op_fops_write (priv->op_s_ctx, file, buf, size, off);
 }
 
 static __poll_t fops_poll (struct file *file, struct poll_table_struct *poll_table)
@@ -125,7 +126,7 @@ static int fops_release (struct inode *inode, struct file *file)
 {
     struct session_context *priv = file->private_data;
 
-    op_fops_release (priv->op_s_ctx);
+    op_fops_release (priv->op_s_ctx, file);
 
     kfree(priv);
 
@@ -147,7 +148,7 @@ static int __init chardev_init (void)
     void *priv_data = NULL; /* Device private data */
     struct class *class;
 
-    pr_info ("[%d] chardev_init is running\n", smp_processor_id ());
+    pr_info ("[%d] chardev_init is running.\n", smp_processor_id ());
 
     g_ctx = kzalloc (sizeof (*g_ctx), GFP_KERNEL);
     if (g_ctx == NULL) {
@@ -158,7 +159,7 @@ static int __init chardev_init (void)
     /* Allocate a major number dynamically */
     rc = alloc_chrdev_region (&g_ctx->major_num, 0, 1, DEVICE_NAME);
     if (rc < 0) {
-        pr_err("chardev: failed to allocate major number\n");
+        pr_err("chardev: failed to allocate major number.\n");
         goto out;
     }
 
@@ -172,7 +173,7 @@ static int __init chardev_init (void)
     /* Initialize a class structure */
     class = class_create (THIS_MODULE, CLASS_NAME);
     if (IS_ERR(class)) {
-        pr_err("chardev: couldn't create device class\n");
+        pr_err("chardev: couldn't create device class.\n");
         rc = PTR_ERR(class);
         goto out_put_device;
     }
@@ -208,7 +209,7 @@ static int __init chardev_init (void)
         goto out_destroy_class;
     }
 
-    pr_info ("[%d] chardev_init exiting\n", smp_processor_id ());
+    pr_info ("[%d] chardev_init exiting.\n", smp_processor_id ());
     return 0;
 
 out_destroy_class:
@@ -222,7 +223,7 @@ out:
 
 static void __exit chardev_exit (void)
 {
-    pr_info ("[%d] chardev_exit is running\n", smp_processor_id ());
+    pr_info ("[%d] chardev_exit is running.\n", smp_processor_id ());
 
     /* Release operator */
     op_exit (g_ctx->op_g_ctx);
@@ -232,7 +233,7 @@ static void __exit chardev_exit (void)
     unregister_chrdev_region (g_ctx->major_num , 1);
     class_destroy (g_ctx->dev.class);
 
-    pr_info ("[%d] chardev_exit exiting\n", smp_processor_id());
+    pr_info ("[%d] chardev_exit exiting.\n", smp_processor_id());
 }
 
 module_init(chardev_init);

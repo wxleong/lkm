@@ -47,10 +47,14 @@ op_fops_open (struct op_glob_context *);
 extern ssize_t
 op_fops_read (struct op_session_context *,
               struct file *, char *, size_t, loff_t *);
+extern ssize_t
+op_fops_write (struct op_session_context *,
+               struct file *, const char *, size_t, loff_t *);
 __poll_t
 op_fops_poll (struct op_session_context *,
               struct file *, struct poll_table_struct *);
 extern int
-op_fops_release (struct op_session_context *);
+op_fops_release (struct op_session_context *,
+                 struct file *);
 
 #endif
