@@ -76,6 +76,7 @@ static struct glob_context *g_ctx;
 
 static int fops_open (struct inode *inode, struct file *file)
 {
+    int ret;
     struct glob_context *glob_ctx;
     struct session_context *priv;
 
@@ -83,11 +84,13 @@ static int fops_open (struct inode *inode, struct file *file)
 
     priv = kzalloc (sizeof (*priv), GFP_KERNEL);
     if (priv == NULL) {
+        ret = -ENOMEM;
         goto out;
     }
 
     priv->op_s_ctx = op_fops_open (glob_ctx->op_g_ctx);
     if (!priv->op_s_ctx) {
+        ret = PTR_ERR (priv->op_s_ctx);
         goto out_free_priv;
     }
 

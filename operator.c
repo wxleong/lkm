@@ -62,8 +62,9 @@
 #define PRIORITY_NORMAL  3
 
 /* Configurable */
-#define WORKER_CPU_CORE_INDEX   0
-#define WORKER_BUSYWAIT_TIMEOUT_US       1000000
+#define MAX_ALLOWED_FOPS_SESSIONS     255
+#define WORKER_CPU_CORE_INDEX         0
+#define WORKER_BUSYWAIT_TIMEOUT_US    1000000
 /**
  * Should be greater than worker's timeout
  * since the blocker worst case scenario is
@@ -129,6 +130,7 @@ struct op_glob_context {
     struct mutex mutex;
     struct list_head list; /* Head of the list */
     atomic_t list_count; /* To keep track of the list */
+    atomic_t fops_session_count; /* To keep track of the fops open sessions */
     bool is_calibrated; /* Measure the total time required to hog all CPU cores */
     int worker_timeout; /* Specify the timeout value for waiting for the blocker to enter blocking mode */
     int blocker_timeout; /* Specify the timeout value for waiting for the worker to complete its execution */
@@ -562,11 +564,14 @@ out:
     pr_info ("Exiting.\n");
 }
 
-static void release_helper (struct op_session_context *ctx)
+static void release_helper (struct op_session_context *s_ctx)
 {
-    while (wait_event_interruptible (ctx->fops_waitq, !ctx->fops_busy)) {};
-    mutex_destroy (&ctx->mutex);
-    kfree (ctx);
+    struct op_glob_context *g_ctx = s_ctx->g_ctx;
+
+    while (wait_event_interruptible (s_ctx->fops_waitq, !s_ctx->fops_busy)) {};
+    mutex_destroy (&s_ctx->mutex);
+    kfree (s_ctx);
+    atomic_dec (&g_ctx->fops_session_count);
 }
 
 static void release_handler (struct work_struct *work)
@@ -692,6 +697,12 @@ __poll_t op_fops_poll (struct op_session_context * s_ctx,
 struct op_session_context *op_fops_open (struct op_glob_context *g_ctx)
 {
     struct op_session_context *ctx;
+
+    if (atomic_read (&g_ctx->fops_session_count) >= MAX_ALLOWED_FOPS_SESSIONS) {
+        return ERR_PTR (-ENOMEM);
+    }
+
+    atomic_inc (&g_ctx->fops_session_count);
 
     ctx = kzalloc (sizeof (*ctx), GFP_KERNEL);
     if (ctx) {
