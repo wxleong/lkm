@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <poll.h>
+#include <errno.h>
 
 #define DEVICE_NODE "/dev/op0"
 
@@ -45,15 +46,15 @@ int test (bool nonblock) {
 
         len = poll(fds, 1, timeout);
         if (len != 1) {
-            perror("poll");
+            perror ("poll");
             goto out_free_fd;
         }
     }
 
     /* Receive response */
-    len = read (fd, buffer, sizeof (buffer));
+    while (len = read (fd, buffer, sizeof (buffer)), errno == -EINTR) {};
     if (len != 1) {
-        perror("read()");
+        perror ("read()");
         goto out_free_fd;
     }
 
