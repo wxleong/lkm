@@ -71,20 +71,6 @@
  */
 #define BLOCKER_BUSYWAIT_TIMEOUT_US      WORKER_BUSYWAIT_TIMEOUT_US + 500000
 /**
- * The sleep operation (in blocker_thread) at the end of the
- * operation is essential for enhancing system responsiveness.
- * The sleep is not placed during the wait_event (wait_event_cmd).
- * This is because the blocker thread has only one wait_event before entering the
- * critical section, and this wait is timing critical, allowing no relaxation.
- *
- * In contrast, in `worker_thread`, a sleep operation is not required.
- * The initial `wait_event` in `worker_thread` is designed to wait for
- * the readiness of `blocker_thread`, and it is not timing critical.
- *
- * This value needs to be adjusted based on your specific platform.
- */
-#define TEST_LOOP_DELAY_MS      100
-/**
  * After the kernel thread is created, a single sleep operation is
  * introduced. Without this pause, the chances of a worker_thread
  * timing out would significantly increase.
@@ -202,7 +188,6 @@ static int blocker_thread (void *data)
 
     pr_info ("[cpu-%d] Started.\n", local_cpu);
 
-    /* ?? */
     //msleep (KTHREAD_SETTLE_TIME_MS);
 
     do {
@@ -212,13 +197,12 @@ static int blocker_thread (void *data)
         /* Indicate to worker_thread that blocker_thread is ready for action */
         local_ctx->lifecycle = KTHREAD_STAT_READY;
         smp_wmb ();
-        wake_up_all (&op_ctx->worker_waitq);
+        wake_up_interruptible_all (&op_ctx->worker_waitq);
 
         /* Wait for start command from worker_thread */
-        wait_event_cmd (op_ctx->blocker_waitq,
-                        (local_ctx->lifecycle == KTHREAD_REQ_START) ||
-                        kthread_should_stop (),,
-                        smp_rmb ());
+        while (wait_event_interruptible (op_ctx->blocker_waitq,
+               (local_ctx->lifecycle == KTHREAD_REQ_START) ||
+               kthread_should_stop ())) {};
 
         if (local_ctx->lifecycle != KTHREAD_REQ_START ||
             kthread_should_stop ()) {
@@ -280,7 +264,7 @@ exit:
 static void service_workqueue (struct op_glob_context *g_ctx)
 {
     int i = atomic_read (&g_ctx->list_count);
-    atomic_sub(i, &g_ctx->list_count);
+    atomic_sub (i, &g_ctx->list_count);
 
     pr_info ("To process number of entries: %d.\n", i);
 
@@ -296,7 +280,7 @@ static void service_workqueue (struct op_glob_context *g_ctx)
         s_ctx->workq_busy = false;
         mutex_unlock (&s_ctx->mutex);
 
-        wake_up_all (&s_ctx->workq_waitq);
+        wake_up_interruptible_all (&s_ctx->workq_waitq);
         kfree (list_ctx);
     }
 }
@@ -332,11 +316,10 @@ static int worker_thread (void *data)
 
             blocker_ctx = &op_ctx->kt_ctx[i];
 
-            wait_event_cmd (op_ctx->worker_waitq,
-                            (blocker_ctx->lifecycle == KTHREAD_STAT_READY) ||
-                            (blocker_ctx->lifecycle == KTHREAD_STAT_DEAD) ||
-                            kthread_should_stop (),,
-                            smp_rmb ());
+            while (wait_event_interruptible (op_ctx->worker_waitq,
+                   (blocker_ctx->lifecycle == KTHREAD_STAT_READY) ||
+                   (blocker_ctx->lifecycle == KTHREAD_STAT_DEAD) ||
+                   kthread_should_stop ())) {};
 
             if (blocker_ctx->lifecycle != KTHREAD_STAT_READY ||
                 kthread_should_stop ()) {
@@ -346,10 +329,9 @@ static int worker_thread (void *data)
         local_ctx->lifecycle = KTHREAD_STAT_READY;
 
         /* Wait for user request */
-        wait_event_cmd (op_ctx->worker_waitq,
-                        atomic_read (&op_ctx->list_count) ||
-                        kthread_should_stop (),,
-                        smp_rmb ());
+        while (wait_event_interruptible (op_ctx->worker_waitq,
+               atomic_read (&op_ctx->list_count) ||
+               kthread_should_stop ())) {};
         if (kthread_should_stop ()) {
             goto exit;
         }
@@ -369,7 +351,7 @@ static int worker_thread (void *data)
             blocker_ctx = &op_ctx->kt_ctx[i];
             blocker_ctx->lifecycle = KTHREAD_REQ_START;
         }
-        wake_up_all (&op_ctx->blocker_waitq);
+        wake_up_interruptible_all (&op_ctx->blocker_waitq);
 
         /* Critical section begins */
         {
@@ -552,12 +534,12 @@ static void execution_handler (struct work_struct *work)
     list_add (&op_list_ctx->list, g_ctx->list.prev);
     mutex_unlock (&g_ctx->mutex);
     atomic_inc (&g_ctx->list_count);
-    wake_up_all (&g_ctx->worker_waitq);
+    wake_up_interruptible_all (&g_ctx->worker_waitq);
 
     /* Wait for the operation */
-    wait_event (s_ctx->workq_waitq,
-                !s_ctx->workq_busy ||
-                g_ctx->kt_ctx[WORKER_CPU_CORE_INDEX].lifecycle == KTHREAD_STAT_DEAD);
+    while (wait_event_interruptible (s_ctx->workq_waitq,
+           !s_ctx->workq_busy ||
+           g_ctx->kt_ctx[WORKER_CPU_CORE_INDEX].lifecycle == KTHREAD_STAT_DEAD)) {};
 
     mutex_lock (&s_ctx->mutex);
 
@@ -582,7 +564,7 @@ out:
 
 static void release_helper (struct op_session_context *ctx)
 {
-    wait_event_interruptible (ctx->fops_waitq, !ctx->fops_busy);
+    while (wait_event_interruptible (ctx->fops_waitq, !ctx->fops_busy)) {};
     mutex_destroy (&ctx->mutex);
     kfree (ctx);
 }
@@ -617,7 +599,9 @@ ssize_t op_fops_read (struct op_session_context *s_ctx,
             pr_info ("~O_NONBLOCK mode, wait for completion before reading the response.\n");
 
             mutex_unlock (&s_ctx->mutex);
-            wait_event_interruptible (s_ctx->fops_waitq, !s_ctx->fops_busy);
+            if (wait_event_interruptible (s_ctx->fops_waitq, !s_ctx->fops_busy)) {
+                return -EINTR;
+            }
             mutex_lock (&s_ctx->mutex);
         }
     } else {
@@ -764,14 +748,22 @@ void op_exit (struct op_glob_context *op_ctx)
     }
 
     /* Wake up all waiting threads */
-    wake_up_all (&op_ctx->worker_waitq);
-    wake_up_all (&op_ctx->blocker_waitq);
+    wake_up_interruptible_all (&op_ctx->worker_waitq);
+    wake_up_interruptible_all (&op_ctx->blocker_waitq);
 
     /* Wait for all kthreads to exit */
     for(cpu_id = 0; cpu_id < op_ctx->cpu_count; cpu_id++) {
         struct kthread_context *kt_ctx = &op_ctx->kt_ctx[cpu_id];
-        wait_event (op_ctx->blocker_waitq,
-                    kt_ctx->lifecycle == KTHREAD_STAT_DEAD);
+        wait_queue_head_t *waitq;
+
+        if (cpu_id == WORKER_CPU_CORE_INDEX) {
+            waitq = &op_ctx->worker_waitq;
+        } else {
+            waitq = &op_ctx->blocker_waitq;
+        }
+
+        while (wait_event_interruptible (
+               *waitq, kt_ctx->lifecycle == KTHREAD_STAT_DEAD)) {};
     }
 
     flush_workqueue (op_ctx->workq);
