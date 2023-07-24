@@ -198,7 +198,6 @@ static int blocker_thread (void *data)
 
         /* Indicate to worker_thread that blocker_thread is ready for action */
         local_ctx->lifecycle = KTHREAD_STAT_READY;
-        smp_wmb ();
         wake_up_interruptible_all (&op_ctx->worker_waitq);
 
         /* Wait for start command from worker_thread */
@@ -217,11 +216,9 @@ static int blocker_thread (void *data)
             preempt_disable ();
 
             local_ctx->lifecycle = KTHREAD_STAT_RUNNING;
-            smp_wmb();
+            smp_wmb(); /* To prevent out-of-order execution on processor and compiler */
 
             while (--timeout) {
-                smp_rmb ();
-
                 if (!op_ctx->is_busy) {
                     break;
                 }
@@ -369,7 +366,6 @@ static int worker_thread (void *data)
                 blocker_ctx = &op_ctx->kt_ctx[i];
 
                 do {
-                    smp_rmb ();
                     if (blocker_ctx->lifecycle == KTHREAD_STAT_RUNNING) {
                         break;
                     }
@@ -395,7 +391,7 @@ static int worker_thread (void *data)
             /* The computation logic ends here */
 
             op_ctx->is_busy = false;
-            smp_wmb ();
+            smp_wmb (); /* To prevent out-of-order execution on processor and compiler */
 
             local_irq_restore (flags);
             preempt_enable ();
