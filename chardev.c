@@ -25,9 +25,12 @@
  ***************************************************************************************/
 /**
  * @file   chardev.c
- * @date   March, 2021
+ * @date   July, 2023
  * @brief  A humble character device
  */
+
+#define pr_fmt(fmt) "%s:%s:%d: " fmt, KBUILD_MODNAME, __func__, __LINE__
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -47,489 +50,193 @@
 #include <linux/sched.h>
 #include <linux/wait.h>
 
+#include "operator.h"
+#include "chardev.h"
+
 /* Constants */
-#define PRIORITY_DEFAULT 0
-#define PRIORITY_RT      1
-#define PRIORITY_RT_LOW  2
-#define PRIORITY_NORMAL  3
+#define CLASS_NAME    "eval"
+#define DEVICE_NAME   "op"
+#define MINOR_NUM     0 /* Device major number is dynamically assigned */
 
-/* Configurable */
-//#define INFINITE_TEST_LOOP
-//#define WORKER_EXIT_ON_TIMEOUT
-#define WORKER_CPU_CORE_INDEX   0
-#define WORKER_BUSYWAIT_TIMEOUT_US       1000000
-/**
- * Should be greater than worker's timeout
- * since the blocker worst case scenario is
- * = worker's timeout + worker's critical section computation time.
- */
-#define BLOCKER_BUSYWAIT_TIMEOUT_US      WORKER_BUSYWAIT_TIMEOUT_US + 500000
-/**
- * The sleep operation (in blocker_thread) at the end of the
- * operation is essential for enhancing system responsiveness.
- * The sleep is not placed during the wait_event (wait_event_cmd).
- * This is because the blocker thread has only one wait_event before entering the
- * critical section, and this wait is timing critical, allowing no relaxation.
- *
- * In contrast, in `worker_thread`, a sleep operation is not required.
- * The initial `wait_event` in `worker_thread` is designed to wait for
- * the readiness of `blocker_thread`, and it is not timing critical.
- *
- * This value needs to be adjusted based on your specific platform.
- */
-#define TEST_LOOP_DELAY_MS      100
-/**
- * After the kernel thread is created, a single sleep operation is
- * introduced. Without this pause, the chances of a worker_thread
- * timing out would significantly increase.
- *
- * This value needs to be adjusted based on your specific platform.
- */
-#define KTHREAD_SETTLE_TIME_MS  100
-#define KTHREAD_PRIORITY        PRIORITY_RT
-#define PRIORITY_NORMAL_VALUE   MIN_NICE /* MIN_NICE (highest priority) to MAX_NICE (lowest priority) */
+/* Global context */
+struct glob_context {
+    struct cdev cdev;
+    struct device dev;
+    dev_t major_num;
 
-enum kthread_lifecycle {
-    KTHREAD_STAT_NULL,
-    KTHREAD_STAT_READY,
-    KTHREAD_REQ_START,
-    KTHREAD_STAT_RUNNING,
-    KTHREAD_REQ_EXIT,
-    KTHREAD_STAT_DEAD,
+    struct op_glob_context *op_g_ctx;
 };
 
-typedef struct {
-    struct task_struct *task;
-    volatile enum kthread_lifecycle lifecycle;
-    int exec_count;
-} cpu_context_struct;
+/* Session Context */
+struct session_context {
+    struct op_session_context *op_s_ctx;
+};
 
-wait_queue_head_t g_wq;
-static cpu_context_struct *g_cpu_contexts;
-volatile static bool g_worker_lock;
-static int g_cpu_count;
-#ifdef INFINITE_TEST_LOOP
-static int g_total_swi_ok_count;
-static int g_total_swi_nok_count;
-static int g_total_worker_timeout_count;
-static int g_total_blocker_timeout_count;
-#endif
+static struct glob_context *g_ctx;
 
-static void sched_set_mode_critical (struct task_struct *task)
+static int fops_open (struct inode *inode, struct file *file)
 {
-#if KTHREAD_PRIORITY == PRIORITY_DEFAULT
-#elif KTHREAD_PRIORITY == PRIORITY_RT
-        sched_set_fifo (task);
-#elif KTHREAD_PRIORITY == PRIORITY_RT_LOW
-        sched_set_fifo_low (task);
-#elif KTHREAD_PRIORITY == PRIORITY_NORMAL
-        sched_set_normal (task, PRIORITY_NORMAL_VALUE);
-#else
-    #error "KTHREAD_PRIORITY is not set"
-#endif
-}
+    int ret;
+    struct glob_context *glob_ctx;
+    struct session_context *priv;
 
-static void sched_set_mode_exit (struct task_struct *task)
-{
-    sched_set_normal (task, MAX_NICE);
-}
+    glob_ctx = container_of(inode->i_cdev, struct glob_context, cdev);
 
-static int blocker_thread (void *unused)
-{
-    int timeout;
-    int local_cpu;
-    unsigned long flags;
-    cpu_context_struct *local_ctx;
-
-    local_cpu = smp_processor_id ();
-
-    if (local_cpu == WORKER_CPU_CORE_INDEX) {
-        printk (KERN_ERR "[%d] blocker_thread is running on the wrong core\n", local_cpu);
-        goto exit;
+    priv = kzalloc (sizeof (*priv), GFP_KERNEL);
+    if (priv == NULL) {
+        ret = -ENOMEM;
+        goto out;
     }
 
-    local_ctx = &g_cpu_contexts[local_cpu];
-
-    printk (KERN_INFO "[%d] blocker_thread is running\n", local_cpu);
-
-    msleep (KTHREAD_SETTLE_TIME_MS);
-
-    do {
-        /* Reset blocker parameters */
-        timeout = BLOCKER_BUSYWAIT_TIMEOUT_US;
-
-        /* Indicate to worker_thread that blocker_thread is ready for action */
-        local_ctx->lifecycle = KTHREAD_STAT_READY;
-        smp_wmb ();
-        wake_up_all (&g_wq);
-
-        /* Wait for start command from worker_thread */
-        wait_event_cmd (g_wq,
-                        (local_ctx->lifecycle == KTHREAD_REQ_START) ||
-                        (local_ctx->lifecycle == KTHREAD_REQ_EXIT),,
-                        smp_rmb ());
-
-        if (local_ctx->lifecycle != KTHREAD_REQ_START ||
-            kthread_should_stop ()) {
-            goto exit;
-        }
-
-        /* Critical section begins */
-        {
-            local_irq_save (flags);
-            preempt_disable ();
-
-            local_ctx->lifecycle = KTHREAD_STAT_RUNNING;
-            smp_wmb();
-
-            while (--timeout) {
-                bool temp;
-
-                smp_rmb ();
-                temp = g_worker_lock;
-
-                if (!temp) {
-                    break;
-                }
-
-                udelay (1);
-            }
-
-            local_ctx->exec_count++;
-
-            local_irq_restore (flags);
-            preempt_enable ();
-        }
-        /* Critical section ends */
-
-        if (!timeout) {
-            printk (KERN_INFO "[%d] The blocker_thread timed out while waiting for the worker_thread to end\n", smp_processor_id ());
-#ifdef INFINITE_TEST_LOOP
-            g_total_blocker_timeout_count++;
-#endif
-        }
-
-#ifdef INFINITE_TEST_LOOP
-
-        msleep(TEST_LOOP_DELAY_MS);
-    } while (!kthread_should_stop ());
-#else
-    } while (0);
-#endif
-
-
-exit:
-
-    sched_set_mode_exit (current);
-
-    local_ctx->lifecycle = KTHREAD_STAT_DEAD;
-    smp_wmb ();
-    wake_up_all (&g_wq);
-
-#ifdef INFINITE_TEST_LOOP
-    while (!kthread_should_stop ()) {
-        yield ();
+    priv->op_s_ctx = op_fops_open (glob_ctx->op_g_ctx);
+    if (!priv->op_s_ctx) {
+        ret = PTR_ERR (priv->op_s_ctx);
+        goto out_free_priv;
     }
-#endif
 
-    printk (KERN_INFO "[%d] blocker_thread exiting. Accumulated execution count is %d\n", smp_processor_id (), local_ctx->exec_count);
+    file->private_data = priv;
+
+    return 0;
+
+out_free_priv:
+    kfree (priv);
+out:
+    return -ENOMEM;
+}
+
+static ssize_t fops_read (struct file *file, char __user *buf, size_t size, loff_t *off)
+{
+    struct session_context *priv = file->private_data;
+
+    return op_fops_read (priv->op_s_ctx, file, buf, size, off);
+}
+
+static ssize_t fops_write (struct file *file, const char __user *buf, size_t size, loff_t *off)
+{
+    struct session_context *priv = file->private_data;
+
+    return op_fops_write (priv->op_s_ctx, file, buf, size, off);
+}
+
+static __poll_t fops_poll (struct file *file, struct poll_table_struct *poll_table)
+{
+    struct session_context *priv = file->private_data;
+
+    return op_fops_poll (priv->op_s_ctx, file, poll_table);
+}
+
+static int fops_release (struct inode *inode, struct file *file)
+{
+    struct session_context *priv = file->private_data;
+
+    op_fops_release (priv->op_s_ctx, file);
+
+    kfree(priv);
 
     return 0;
 }
 
-static int worker_thread (void *unused)
-{
-    int timeout;
-    int local_cpu;
-    int i;
-    uint16_t ret = -1;
-    unsigned long flags;
-    cpu_context_struct *blocker_ctx;
-    cpu_context_struct *local_ctx;
-
-    local_cpu = smp_processor_id ();
-
-    if (local_cpu != WORKER_CPU_CORE_INDEX) {
-        printk (KERN_ERR "[%d] worker_thread is running on the wrong core\n", local_cpu);
-        goto exit;
-    }
-
-    local_ctx = &g_cpu_contexts[local_cpu];
-
-    printk (KERN_INFO "[%d] worker_thread is running\n", local_cpu);
-
-    do {
-        /* Wait for blocker threads to become ready */
-        for (i = 0; i < g_cpu_count; i++) {
-            if (i == WORKER_CPU_CORE_INDEX) {
-                continue;
-            }
-
-            blocker_ctx = &g_cpu_contexts[i];
-
-            wait_event_cmd (g_wq,
-                            (blocker_ctx->lifecycle == KTHREAD_STAT_READY) ||
-                            (blocker_ctx->lifecycle == KTHREAD_STAT_DEAD),,
-                            smp_rmb ());
-
-            if (blocker_ctx->lifecycle != KTHREAD_STAT_READY ||
-                kthread_should_stop ()) {
-                goto exit;
-            }
-        }
-
-        /* Reset worker parameters */
-        timeout = WORKER_BUSYWAIT_TIMEOUT_US;
-        g_worker_lock = true;
-        local_ctx->lifecycle = KTHREAD_STAT_READY;
-        smp_wmb ();
-        wake_up_all (&g_wq);
-        local_ctx->exec_count++;
-
-        /* Issue start command to blocker threads */
-        for (i = 0; i < g_cpu_count; i++) {
-            if (i == WORKER_CPU_CORE_INDEX) {
-                continue;
-            }
-
-            blocker_ctx = &g_cpu_contexts[i];
-            blocker_ctx->lifecycle = KTHREAD_REQ_START;
-            smp_wmb ();
-        }
-        wake_up_all (&g_wq);
-
-        /* Critical section begins */
-        {
-            local_irq_save (flags);
-            preempt_disable ();
-
-            /* Wait for blocker_thread to enter critical section */
-            for (i = 0; i < g_cpu_count; i++) {
-                if (i == WORKER_CPU_CORE_INDEX) {
-                    continue;
-                }
-
-                blocker_ctx = &g_cpu_contexts[i];
-
-                do {
-                    smp_rmb ();
-                    if (blocker_ctx->lifecycle == KTHREAD_STAT_RUNNING) {
-                        break;
-                    }
-
-                    udelay (1);
-                } while (--timeout);
-
-                if (!timeout) {
-#ifdef WORKER_EXIT_ON_TIMEOUT
-                    goto exit_cri;
-#else
-                    break;
-#endif
-                }
-            }
-
-            /* The computation logic begins here */
-
-            do {
-                int delay_ms = 400;
-                while (--delay_ms) {
-                    udelay(1000);
-                }
-                ret = 0;
-            } while (false);
-
-            /* The computation logic ends here */
-
-#ifdef WORKER_EXIT_ON_TIMEOUT
-exit_cri:
-#endif
-            g_worker_lock = false;
-            smp_wmb ();
-
-            local_irq_restore (flags);
-            preempt_enable ();
-        }
-        /* Critical section ends */
-
-        if (!timeout) {
-            printk (KERN_INFO "[%d] The worker_thread timed out while waiting for the blocker_thread (%d) to start\n", local_cpu, i);
-
-#ifdef INFINITE_TEST_LOOP
-            g_total_worker_timeout_count++;
-#endif
-        }
-
-        if (ret != 0) {
-#ifdef INFINITE_TEST_LOOP
-            g_total_swi_nok_count++;
-            printk (KERN_INFO "[%d] worker_thread execution has failed (ok = %d, nok = %d, worker timeout = %d, blocker timeout = %d).\n",
-                    local_cpu, g_total_swi_ok_count, g_total_swi_nok_count, g_total_worker_timeout_count, g_total_blocker_timeout_count);
-#else
-            printk (KERN_INFO "[%d] worker_thread execution has failed.\n", local_cpu);
-#endif
-        } else {
-#ifdef INFINITE_TEST_LOOP
-            g_total_swi_ok_count++;
-            printk (KERN_INFO "[%d] worker_thread execution has passed (ok = %d, nok = %d, worker timeout = %d, blocker timeout = %d).\n",
-                    local_cpu, g_total_swi_ok_count, g_total_swi_nok_count, g_total_worker_timeout_count, g_total_blocker_timeout_count);
-#else
-            printk (KERN_INFO "[%d] worker_thread execution has passed.\n", local_cpu);
-#endif
-        }
-
-#ifdef INFINITE_TEST_LOOP
-    } while (!kthread_should_stop ());
-#else
-    } while (0);
-#endif
-
-exit:
-
-    sched_set_mode_exit (current);
-
-    /* Notify blocker_thread to exit */
-    for (i = 0; i < g_cpu_count; i++) {
-        if (i == WORKER_CPU_CORE_INDEX) {
-            continue;
-        }
-
-        blocker_ctx = &g_cpu_contexts[i];
-
-        wait_event_cmd (g_wq,
-                        blocker_ctx->lifecycle == KTHREAD_STAT_READY ||
-                        blocker_ctx->lifecycle == KTHREAD_STAT_DEAD,,
-                        smp_rmb ());
-
-        if (blocker_ctx->lifecycle == KTHREAD_STAT_READY) {
-            blocker_ctx->lifecycle = KTHREAD_REQ_EXIT;
-            smp_wmb ();
-            wake_up_all (&g_wq);
-        }
-    }
-
-    local_ctx->lifecycle = KTHREAD_STAT_DEAD;
-    smp_wmb ();
-    wake_up_all (&g_wq);
-
-#ifdef INFINITE_TEST_LOOP
-    while (!kthread_should_stop ()) {
-        yield ();
-    }
-#endif
-
-    printk (KERN_INFO "[%d] worker_thread exiting. Accumulated execution count is %d\n", local_cpu, local_ctx->exec_count);
-
-    return 0;
-}
-
-static int spawner (void)
-{
-    int cpu_id;
-    int cpu;
-    char string[256] = {0};
-
-    for_each_online_cpu (cpu) {
-        g_cpu_count++;
-    }
-
-    printk (KERN_INFO "[%d] spawner is running\n", smp_processor_id ());
-
-    if (g_cpu_count < 2) {
-        printk (KERN_ERR "spawner cannot proceed due to insufficient CPU cores\n");
-        return 0;
-    }
-
-    printk (KERN_INFO "[%d] total CPU count: %d\n", smp_processor_id (), g_cpu_count);
-
-#ifdef INFINITE_TEST_LOOP
-    g_total_swi_ok_count = 0;
-    g_total_swi_nok_count = 0;
-    g_total_worker_timeout_count = 0;
-    g_total_blocker_timeout_count = 0;
-#endif
-
-    g_cpu_contexts = kzalloc (sizeof (cpu_context_struct) * g_cpu_count, GFP_KERNEL);
-
-    if (g_cpu_contexts == NULL) {
-        printk (KERN_ERR "spawner kmalloc has failed\n");
-        return 0;
-    }
-
-    init_waitqueue_head (&g_wq);
-
-    /* Create and initialize kthreads */
-    for (cpu_id = 0; cpu_id < g_cpu_count; cpu_id++) {
-        cpu_context_struct *ctx = &g_cpu_contexts[cpu_id];
-
-        ctx->lifecycle = KTHREAD_STAT_NULL;
-
-        /* We want the spawner_thread and worker_thread to operate on the same core */
-        if (cpu_id == WORKER_CPU_CORE_INDEX) {
-            snprintf(string, sizeof(string), "worker_thread (cpu %d)", cpu_id);
-            ctx->task = kthread_create(worker_thread, NULL, string);
-        } else {
-            snprintf (string, sizeof (string), "blocker_thread (cpu %d)", cpu_id);
-            ctx->task = kthread_create (blocker_thread, NULL, string);
-        }
-
-        if (IS_ERR_OR_NULL (ctx->task)) {
-            printk (KERN_ERR "spawner kthread_create(worker_thread/blocker_thread) has failed, exiting spawner...\n");
-            return 0;
-        }
-
-        printk (KERN_INFO "[%d] Created a worker/blocker kthread and bound it to the cpu %d, scheduling policy %d\n", smp_processor_id (), cpu_id, ctx->task->policy);
-
-        kthread_bind (ctx->task, cpu_id);
-
-        /* Set scheduling policy */
-        sched_set_mode_critical (current);
-    }
-
-    /* Launch kthreads */
-    for (cpu_id = g_cpu_count - 1; cpu_id >= 0; cpu_id--) {
-        cpu_context_struct *ctx = &g_cpu_contexts[cpu_id];
-
-        wake_up_process (ctx->task);
-    }
-
-    return 0;
-}
+static const struct file_operations chardev_fops = {
+    .owner = THIS_MODULE,
+    .open = fops_open,
+    .read = fops_read,
+    .write = fops_write,
+    .poll = fops_poll,
+    .release = fops_release,
+};
 
 static int __init chardev_init (void)
 {
-    printk (KERN_INFO "[%d] chardev_init is running\n", smp_processor_id ());
+    int rc;
+    void *priv_data = NULL; /* Device private data */
+    struct class *class;
 
-    spawner ();
+    pr_info ("[%d] chardev_init is running.\n", smp_processor_id ());
 
-    printk (KERN_INFO "[%d] chardev_init exiting\n", smp_processor_id ());
+    g_ctx = kzalloc (sizeof (*g_ctx), GFP_KERNEL);
+    if (g_ctx == NULL) {
+        rc = -ENOMEM;
+        goto out;
+    }
 
+    /* Allocate a major number dynamically */
+    rc = alloc_chrdev_region (&g_ctx->major_num, 0, 1, DEVICE_NAME);
+    if (rc < 0) {
+        pr_err("chardev: failed to allocate major number.\n");
+        goto out;
+    }
+
+    /* Initialize a cdev structure */
+    cdev_init (&g_ctx->cdev, &chardev_fops);
+    g_ctx->cdev.owner = THIS_MODULE;
+
+    /* Initialize a device structure */
+    device_initialize (&g_ctx->dev);
+
+    /* Initialize a class structure */
+    class = class_create (THIS_MODULE, CLASS_NAME);
+    if (IS_ERR(class)) {
+        pr_err("chardev: couldn't create device class.\n");
+        rc = PTR_ERR(class);
+        goto out_put_device;
+    }
+
+    g_ctx->dev.class = class;
+    //g_ctx->dev.class->shutdown_pre = NULL;
+    //g_ctx->dev.release = NULL;
+    //g_ctx->dev.parent = NULL;
+    //g_ctx->dev.groups = NULL; /* sysfs attribute_group */
+
+    g_ctx->dev.devt = MKDEV(MAJOR(g_ctx->major_num), MINOR_NUM);
+
+    rc = dev_set_name(&g_ctx->dev, "%s%d", DEVICE_NAME, MINOR_NUM);
+    if (rc) {
+        goto out_destroy_class;
+    }
+
+    dev_set_drvdata (&g_ctx->dev, priv_data);
+
+    /* Create a char device */
+    rc = cdev_device_add (&g_ctx->cdev, &g_ctx->dev);
+    if (rc) {
+        dev_err (&g_ctx->dev,
+            "unable to cdev_device_add() %s, major %d, minor %d, err=%d\n",
+            dev_name (&g_ctx->dev), MAJOR (g_ctx->dev.devt),
+            MINOR (g_ctx->dev.devt), rc);
+        goto out_destroy_class;
+    }
+
+    /* Initialize operator */
+    rc = op_init (&g_ctx->op_g_ctx);
+    if (rc) {
+        goto out_destroy_class;
+    }
+
+    pr_info ("[%d] chardev_init exiting.\n", smp_processor_id ());
     return 0;
+
+out_destroy_class:
+    class_destroy (class);
+out_put_device:
+    put_device (&g_ctx->dev);
+    unregister_chrdev_region (g_ctx->major_num , 1);
+out:
+    return rc;
 }
 
 static void __exit chardev_exit (void)
 {
-    int cpu_id = 0;
-    cpu_context_struct *ctx;
+    pr_info ("[%d] chardev_exit is running.\n", smp_processor_id ());
 
-    printk (KERN_INFO "[%d] chardev_exit is running\n", smp_processor_id ());
+    /* Release operator */
+    op_exit (g_ctx->op_g_ctx);
 
-#ifdef INFINITE_TEST_LOOP
-    for(cpu_id = 0; cpu_id < g_cpu_count; cpu_id++) {
-        if (!IS_ERR_OR_NULL (g_cpu_contexts[cpu_id].task)) {
-            kthread_stop (g_cpu_contexts[cpu_id].task);
-        }
-    }
-#endif
+    /* Release the char device and its associated resources */
+    cdev_device_del (&g_ctx->cdev, &g_ctx->dev);
+    unregister_chrdev_region (g_ctx->major_num , 1);
+    class_destroy (g_ctx->dev.class);
 
-    for(cpu_id = 0; cpu_id < g_cpu_count; cpu_id++) {
-        ctx = &g_cpu_contexts[cpu_id];
-        wait_event (g_wq,
-                    ctx->lifecycle == KTHREAD_STAT_DEAD);
-    }
-
-    kfree (g_cpu_contexts);
-    printk (KERN_INFO "[%d] chardev_exit exiting\n", smp_processor_id());
+    pr_info ("[%d] chardev_exit exiting.\n", smp_processor_id());
 }
 
 module_init(chardev_init);
