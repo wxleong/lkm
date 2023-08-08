@@ -26,35 +26,115 @@
 /**
  * @file   chardev.h
  * @date   July, 2023
- * @brief  Header file
+ * @brief  Manage the initialization and operation of character devices.
  */
 #ifndef __CHARDEV_H__
 #define __CHARDEV_H__
 
-/* Global operation context */
-struct op_glob_context;
+#include <linux/cdev.h>
+#include "common.h"
 
-/* Session operation context */
-struct op_session_context;
+#define CHARDEV_CONTEXT_MAGIC      0x3D59F79E
 
-extern int
-op_init (struct op_glob_context **);
-extern void
-op_exit (struct op_glob_context *);
+typedef struct common_context chardev_context;
 
-extern struct op_session_context *
-op_fops_open (struct op_glob_context *);
-extern ssize_t
-op_fops_read (struct op_session_context *,
-              struct file *, char *, size_t, loff_t *);
-extern ssize_t
-op_fops_write (struct op_session_context *,
-               struct file *, const char *, size_t, loff_t *);
-__poll_t
-op_fops_poll (struct op_session_context *,
-              struct file *, struct poll_table_struct *);
-extern int
-op_fops_release (struct op_session_context *,
-                 struct file *);
+typedef struct common_context chardev_child_context;
+typedef struct common_context chardev_child_session_context;
 
+typedef int
+(*CHARDEV_CHILD_OPEN_FUNC)(chardev_child_context *child_ctx,
+                           chardev_child_session_context **child_s_ctx);
+/**
+ * typedef CHARDEV_CHILD_READ1_FUNC - To retrieve a buffer for reading.
+ * @child_s_ctx: chardev's child session context.
+ * @buf: A buffer pointer will be returned here for reading.
+ *
+ * Returns the size of data that can be read from @buf. In case of an error,
+ * a negative value is returned.
+ */
+typedef ssize_t
+(*CHARDEV_CHILD_READ1_FUNC)(chardev_child_session_context *child_s_ctx,
+                            char **buf);
+/**
+ * typedef CHARDEV_CHILD_READ2_FUNC - To notify the progress of reading.
+ * @child_s_ctx: chardev's child session context.
+ * @len: The number of bytes that have been read by caller.
+ *
+ * If @len is zero, it indicates that the read operation
+ * has been completed, regardless of whether there are still
+ * remaining bytes to be read.
+ *
+ * Returns:
+ * The returned value should be equal to @len. In case of an
+ * error, a negative value is returned.
+ */
+typedef ssize_t
+(*CHARDEV_CHILD_READ2_FUNC)(chardev_child_session_context *child_s_ctx,
+                            size_t len);
+/**
+ * typedef CHARDEV_CHILD_WRITE1_FUNC - To retrieve a buffer for writing.
+ * @child_s_ctx: chardev's child session context.
+ * @buf: A buffer pointer will be returned here for writing.
+ *
+ * The @buf can be written to freely prior to calling _WRITE2_FUNC
+ *
+ * Returns the size of @buf. In case of an error, a negative
+ * value is returned.
+ */
+typedef ssize_t
+(*CHARDEV_CHILD_WRITE1_FUNC)(chardev_child_session_context *child_s_ctx,
+                             char **buf);
+/**
+ * typedef CHARDEV_CHILD_WRITE2_FUNC - To update the progress of writing.
+ * @child_s_ctx: chardev's child session context.
+ * @len: The number of bytes that have been written by caller.
+ *
+ * Partial writing is not supported. Invoking this function with
+ * a non-zero @len will initiate the processing of received
+ * data. If the @len value is zero, the function will exit
+ * without performing any action, returning zero.
+ *
+ * Returns:
+ * The returned value should be equal to @len. In case of an
+ * error, a negative value is returned.
+ */
+typedef ssize_t
+(*CHARDEV_CHILD_WRITE2_FUNC)(chardev_child_session_context *child_s_ctx,
+                             size_t len);
+typedef __poll_t
+(*CHARDEV_CHILD_POLL_FUNC)(chardev_child_session_context *child_s_ctx,
+                           wait_queue_head_t **waitq);
+typedef int
+(*CHARDEV_CHILD_RELEASE_FUNC)(chardev_child_session_context *child_s_ctx);
+
+struct chardev_child_funcs {
+    CHARDEV_CHILD_OPEN_FUNC         open;
+
+    CHARDEV_CHILD_WRITE1_FUNC       write1; /* To retrieve write buffer */
+    CHARDEV_CHILD_WRITE2_FUNC       write2; /* To notify the progress of write */
+
+    CHARDEV_CHILD_READ1_FUNC        read1; /* To retrieve read buffer */
+    CHARDEV_CHILD_READ2_FUNC        read2; /* To notify the progress of read */
+
+    CHARDEV_CHILD_POLL_FUNC         poll;
+    CHARDEV_CHILD_RELEASE_FUNC      release;
+};
+
+/**
+ * chardev_init - Initialize chardev context.
+ * @cd_ctx: Returns the chardev context.
+ * @attr_groups: Input for attribute groups.
+ *
+ * The array of attribute groups is terminated with a NULL entry.
+ *
+ * Returns:
+ * On success, 0 is returned. In case of an error,
+ * a negative value is returned.
+ */
+int chardev_init(chardev_context **cd_ctx,
+                 const struct attribute_group **attr_groups);
+void chardev_exit(chardev_context **);
+int chardev_set_hook(chardev_context *,
+                     chardev_child_context *,
+                     const struct chardev_child_funcs *);
 #endif

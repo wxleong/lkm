@@ -1,6 +1,8 @@
-obj-m = lkm.o
-lkm-objs := chardev.o
-lkm-objs += operator.o
+obj-m = mod.o
+mod-objs += lkm.o
+mod-objs += realtime.o
+mod-objs += resource-manager.o
+mod-objs += chardev.o
 
 ccflags-y := -std=gnu99 -Wno-vla
 
@@ -9,4 +11,4 @@ all:
 	gcc test.c -o test
 clean:
 	make -C /lib/modules/`uname -r`/build M=$(PWD) clean
-	rm test
+	rm -f test

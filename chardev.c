@@ -26,10 +26,9 @@
 /**
  * @file   chardev.c
  * @date   July, 2023
- * @brief  A humble character device
+ * @brief  Refer to chardev.h
  */
-
-#define pr_fmt(fmt) "%s:%s:%d: " fmt, KBUILD_MODNAME, __func__, __LINE__
+#define pr_fmt(fmt) "%s:%s:%s:%d: " fmt, KBUILD_MODNAME, __FILE__, __func__, __LINE__
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -44,13 +43,12 @@
 #include <linux/gpio.h>
 #include <linux/gpio/consumer.h>
 #include <linux/ktime.h>
-#include <linux/cdev.h>
 #include <linux/dmaengine.h>
 #include <linux/interrupt.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
+#include <linux/poll.h>
 
-#include "operator.h"
 #include "chardev.h"
 
 /* Constants */
@@ -58,80 +56,182 @@
 #define DEVICE_NAME   "op"
 #define MINOR_NUM     0 /* Device major number is dynamically assigned */
 
-/* Global context */
-struct glob_context {
+struct this_context {
+    struct common_context common;
+
     struct cdev cdev;
     struct device dev;
     dev_t major_num;
 
-    struct op_glob_context *op_g_ctx;
+    chardev_child_context *child_ctx;
+    const struct chardev_child_funcs *child_funcs;
 };
 
-/* Session Context */
-struct session_context {
-    struct op_session_context *op_s_ctx;
+struct fops_context {
+    struct this_context *parent;
+    chardev_child_session_context *child_ctx;
 };
 
-static struct glob_context *g_ctx;
-
-static int fops_open (struct inode *inode, struct file *file)
+static struct this_context *context_cast(chardev_context *ctx)
 {
-    int ret;
-    struct glob_context *glob_ctx;
-    struct session_context *priv;
+    if (ctx != NULL && ctx->magic == CHARDEV_CONTEXT_MAGIC) {
+        return container_of(ctx, struct this_context, common);
+    }
 
-    glob_ctx = container_of(inode->i_cdev, struct glob_context, cdev);
+    return NULL;
+}
 
-    priv = kzalloc (sizeof (*priv), GFP_KERNEL);
-    if (priv == NULL) {
-        ret = -ENOMEM;
+static int fops_open(struct inode *inode, struct file *file)
+{
+    int rc;
+    struct this_context *this;
+    struct fops_context *fops_ctx;
+
+    this = container_of(inode->i_cdev, struct this_context, cdev);
+
+    if (!this || !this->child_funcs)
+    {
+        rc = -EFAULT;
         goto out;
     }
 
-    priv->op_s_ctx = op_fops_open (glob_ctx->op_g_ctx);
-    if (!priv->op_s_ctx) {
-        ret = PTR_ERR (priv->op_s_ctx);
-        goto out_free_priv;
+    fops_ctx = kzalloc(sizeof(*fops_ctx), GFP_KERNEL);
+    if (fops_ctx == NULL) {
+        rc = -ENOMEM;
+        goto out;
     }
 
-    file->private_data = priv;
+    fops_ctx->parent = this;
+
+    rc = this->child_funcs->open(this->child_ctx, &fops_ctx->child_ctx);
+    if (rc) {
+        goto out_free_fops_ctx;
+    }
+
+    file->private_data = fops_ctx;
 
     return 0;
 
-out_free_priv:
-    kfree (priv);
+out_free_fops_ctx:
+    kfree(fops_ctx);
 out:
-    return -ENOMEM;
+    return rc;
 }
 
-static ssize_t fops_read (struct file *file, char __user *buf, size_t size, loff_t *off)
+static ssize_t fops_read(struct file *file, char __user *buf, size_t size, loff_t *off)
 {
-    struct session_context *priv = file->private_data;
+    struct fops_context *fops_ctx = file->private_data;
+    char *child_buf;
+    ssize_t rc;
+    ssize_t len_to_read;
+    wait_queue_head_t *wq;
+    __poll_t mask;
 
-    return op_fops_read (priv->op_s_ctx, file, buf, size, off);
+    if (!(file->f_flags & O_NONBLOCK)) {
+        /* Blocking */
+        might_sleep();
+        mask = fops_ctx->parent->child_funcs->poll(fops_ctx->child_ctx, &wq);
+        if (___wait_event(*wq, mask != 0, TASK_INTERRUPTIBLE, 0, 0,
+            schedule(); mask = fops_ctx->parent->child_funcs->poll(fops_ctx->child_ctx, &wq);)) {
+            rc = -EINTR;
+            goto out;
+        }
+    }
+
+    rc = fops_ctx->parent->child_funcs->read1(fops_ctx->child_ctx, &child_buf);
+    if (rc <= 0) {
+        goto out_read_finalize;
+    }
+
+    if (*off > rc) {
+        rc = -EFAULT;
+        goto out_read_finalize;
+    }
+
+    len_to_read = min_t(ssize_t, rc - *off, size);
+    if (!len_to_read) {
+        rc = 0;
+        goto out_read_finalize;
+    }
+
+    rc = copy_to_user(buf, child_buf + *off, len_to_read);
+    if (rc) {
+        rc = -EFAULT;
+        goto out_read_finalize;
+    }
+
+    rc = fops_ctx->parent->child_funcs->read2(fops_ctx->child_ctx, len_to_read);
+    if (rc <= 0) {
+        goto out_set_off_zero;
+    }
+
+    *off += rc;
+    goto out;
+
+out_read_finalize:
+    fops_ctx->parent->child_funcs->read2(fops_ctx->child_ctx, 0);
+out_set_off_zero:
+    *off = 0;
+out:
+    return rc;
 }
 
-static ssize_t fops_write (struct file *file, const char __user *buf, size_t size, loff_t *off)
+static ssize_t fops_write(struct file *file, const char __user *buf, size_t size, loff_t *off)
 {
-    struct session_context *priv = file->private_data;
+    struct fops_context *fops_ctx = file->private_data;
+    char *child_buf;
+    ssize_t rc;
 
-    return op_fops_write (priv->op_s_ctx, file, buf, size, off);
+    rc = fops_ctx->parent->child_funcs->write1(fops_ctx->child_ctx, &child_buf);
+    if (rc <= 0) {
+        goto out_write_finalize;
+    }
+
+    if (rc < size) {
+        rc = -EFBIG;
+        goto out_write_finalize;
+    }
+
+    rc = copy_from_user(child_buf, buf, size);
+    if (rc) {
+        rc = -EFAULT;
+        goto out_write_finalize;
+    }
+
+    /* Process the command */
+    rc = fops_ctx->parent->child_funcs->write2(fops_ctx->child_ctx, size);
+
+    /*
+     * The received command will be processed immediately;
+     * therefore, partial write operations are not supported here.
+     */
+    *off = 0;
+
+out_write_finalize:
+    return rc;
+
 }
 
-static __poll_t fops_poll (struct file *file, struct poll_table_struct *poll_table)
+static __poll_t fops_poll(struct file *file, struct poll_table_struct *poll_table)
 {
-    struct session_context *priv = file->private_data;
+    struct fops_context *fops_ctx = file->private_data;
+    wait_queue_head_t *wq;
+    __poll_t mask;
 
-    return op_fops_poll (priv->op_s_ctx, file, poll_table);
+    mask = fops_ctx->parent->child_funcs->poll(fops_ctx->child_ctx, &wq);
+
+    poll_wait(file, wq, poll_table);
+
+    return mask;
 }
 
-static int fops_release (struct inode *inode, struct file *file)
+static int fops_release(struct inode *inode, struct file *file)
 {
-    struct session_context *priv = file->private_data;
+    struct fops_context *fops_ctx = file->private_data;
 
-    op_fops_release (priv->op_s_ctx, file);
-
-    kfree(priv);
+    fops_ctx->parent->child_funcs->release(fops_ctx->child_ctx);
+    kfree(fops_ctx);
+    file->private_data = NULL;
 
     return 0;
 }
@@ -145,103 +245,131 @@ static const struct file_operations chardev_fops = {
     .release = fops_release,
 };
 
-static int __init chardev_init (void)
+int chardev_init(chardev_context **cd_ctx, const struct attribute_group **attr_groups)
 {
     int rc;
     void *priv_data = NULL; /* Device private data */
     struct class *class;
+    struct this_context *this;
 
-    pr_info ("[%d] chardev_init is running.\n", smp_processor_id ());
+    pr_info("chardev_init started.\n");
 
-    g_ctx = kzalloc (sizeof (*g_ctx), GFP_KERNEL);
-    if (g_ctx == NULL) {
+    this = kzalloc(sizeof(*this), GFP_KERNEL);
+    if (!this) {
         rc = -ENOMEM;
         goto out;
     }
 
+    this->common.magic = CHARDEV_CONTEXT_MAGIC;
+
+    /* Sanity check */
+    if (context_cast(&this->common) != this) {
+        rc = -EFAULT;
+        goto out_free_this;
+    }
+
+    *cd_ctx = &this->common;
+
     /* Allocate a major number dynamically */
-    rc = alloc_chrdev_region (&g_ctx->major_num, 0, 1, DEVICE_NAME);
+    rc = alloc_chrdev_region(&this->major_num, 0, 1, DEVICE_NAME);
     if (rc < 0) {
         pr_err("chardev: failed to allocate major number.\n");
-        goto out;
+        goto out_free_this;
     }
 
     /* Initialize a cdev structure */
-    cdev_init (&g_ctx->cdev, &chardev_fops);
-    g_ctx->cdev.owner = THIS_MODULE;
+    cdev_init(&this->cdev, &chardev_fops);
+    this->cdev.owner = THIS_MODULE;
 
     /* Initialize a device structure */
-    device_initialize (&g_ctx->dev);
+    device_initialize(&this->dev);
 
     /* Initialize a class structure */
-    class = class_create (THIS_MODULE, CLASS_NAME);
+    class = class_create(THIS_MODULE, CLASS_NAME);
     if (IS_ERR(class)) {
         pr_err("chardev: couldn't create device class.\n");
         rc = PTR_ERR(class);
         goto out_put_device;
     }
 
-    g_ctx->dev.class = class;
-    //g_ctx->dev.class->shutdown_pre = NULL;
-    //g_ctx->dev.release = NULL;
-    //g_ctx->dev.parent = NULL;
-    //g_ctx->dev.groups = NULL; /* sysfs attribute_group */
+    this->dev.class = class;
+    //this->dev.class->shutdown_pre = NULL;
+    //this->dev.release = NULL;
+    //this->dev.parent = NULL;
+    this->dev.groups = attr_groups;
 
-    g_ctx->dev.devt = MKDEV(MAJOR(g_ctx->major_num), MINOR_NUM);
+    this->dev.devt = MKDEV(MAJOR(this->major_num), MINOR_NUM);
 
-    rc = dev_set_name(&g_ctx->dev, "%s%d", DEVICE_NAME, MINOR_NUM);
+    rc = dev_set_name(&this->dev, "%s%d", DEVICE_NAME, MINOR_NUM);
     if (rc) {
         goto out_destroy_class;
     }
 
-    dev_set_drvdata (&g_ctx->dev, priv_data);
+    dev_set_drvdata(&this->dev, priv_data);
 
     /* Create a char device */
-    rc = cdev_device_add (&g_ctx->cdev, &g_ctx->dev);
+    rc = cdev_device_add(&this->cdev, &this->dev);
     if (rc) {
-        dev_err (&g_ctx->dev,
+        dev_err(&this->dev,
             "unable to cdev_device_add() %s, major %d, minor %d, err=%d\n",
-            dev_name (&g_ctx->dev), MAJOR (g_ctx->dev.devt),
-            MINOR (g_ctx->dev.devt), rc);
+            dev_name(&this->dev), MAJOR(this->dev.devt),
+            MINOR(this->dev.devt), rc);
         goto out_destroy_class;
     }
 
-    /* Initialize operator */
-    rc = op_init (&g_ctx->op_g_ctx);
-    if (rc) {
-        goto out_destroy_class;
-    }
-
-    pr_info ("[%d] chardev_init exiting.\n", smp_processor_id ());
-    return 0;
+    rc = 0;
+    goto out;
 
 out_destroy_class:
-    class_destroy (class);
+    class_destroy(class);
 out_put_device:
-    put_device (&g_ctx->dev);
-    unregister_chrdev_region (g_ctx->major_num , 1);
+    put_device(&this->dev);
+    unregister_chrdev_region(this->major_num , 1);
+out_free_this:
+    kfree(this);
 out:
+    pr_info("chardev_init ended.\n");
     return rc;
 }
 
-static void __exit chardev_exit (void)
+int chardev_set_hook(chardev_context *cd_ctx,
+                     chardev_child_context *child_ctx,
+                     const struct chardev_child_funcs *child_funcs)
 {
-    pr_info ("[%d] chardev_exit is running.\n", smp_processor_id ());
+    struct this_context *this = context_cast(cd_ctx);
 
-    /* Release operator */
-    op_exit (g_ctx->op_g_ctx);
+    if (!this || !child_ctx ||
+        !child_funcs ||
+        !child_funcs->open ||
+        !child_funcs->write1 ||
+        !child_funcs->write2 ||
+        !child_funcs->read1 ||
+        !child_funcs->read2 ||
+        !child_funcs->poll ||
+        !child_funcs->release) {
+        return -EINVAL;
+    }
 
-    /* Release the char device and its associated resources */
-    cdev_device_del (&g_ctx->cdev, &g_ctx->dev);
-    unregister_chrdev_region (g_ctx->major_num , 1);
-    class_destroy (g_ctx->dev.class);
+    this->child_ctx = child_ctx;
+    this->child_funcs = child_funcs;
 
-    pr_info ("[%d] chardev_exit exiting.\n", smp_processor_id());
+    return 0;
 }
 
-module_init(chardev_init);
-module_exit(chardev_exit);
+void chardev_exit(chardev_context **cd_ctx)
+{
+    struct this_context *this = context_cast(*cd_ctx);
 
-MODULE_DESCRIPTION("A Humble Character Device Module");
-MODULE_LICENSE("GPL");
-MODULE_VERSION("202306");
+    pr_info("chardev_exit started.\n");
+
+    /* Release the char device and its associated resources */
+    cdev_device_del(&this->cdev, &this->dev);
+    unregister_chrdev_region(this->major_num , 1);
+    class_destroy(this->dev.class);
+
+    /* Release chardev_context */
+    kfree(this);
+    *cd_ctx = NULL;
+
+    pr_info("chardev_exit ended.\n");
+}
