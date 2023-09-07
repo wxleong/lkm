@@ -61,24 +61,16 @@
 #define PRIORITY_NORMAL  3
 
 /* Configurable */
-#define WORKER_CPU_CORE_INDEX         0
-#define WORKER_BUSYWAIT_TIMEOUT_US    1000000
+#define WORKER_CPU_CORE_INDEX           0
+#define WORKER_BUSYWAIT_TIMEOUT_US      1000000
 /**
  * Should be greater than worker's timeout
  * since the blocker worst case scenario is
  * = worker's timeout + worker's critical section computation time.
  */
-#define BLOCKER_BUSYWAIT_TIMEOUT_US      WORKER_BUSYWAIT_TIMEOUT_US + 500000
-/**
- * After the kernel thread is created, a single sleep operation is
- * introduced. Without this pause, the chances of a worker_thread
- * timing out would significantly increase.
- *
- * This value needs to be adjusted based on your specific platform.
- */
-#define KTHREAD_SETTLE_TIME_MS  100
-#define KTHREAD_PRIORITY        PRIORITY_RT
-#define PRIORITY_NORMAL_VALUE   MIN_NICE /* MIN_NICE(highest priority) to MAX_NICE(lowest priority) */
+#define BLOCKER_BUSYWAIT_TIMEOUT_US     WORKER_BUSYWAIT_TIMEOUT_US + 500000
+#define KTHREAD_PRIORITY                PRIORITY_RT
+#define PRIORITY_NORMAL_VALUE           MIN_NICE /* MIN_NICE(highest priority) to MAX_NICE(lowest priority) */
 
 enum kthread_lifecycle {
     KTHREAD_STAT_NULL,
@@ -173,9 +165,9 @@ static void sched_set_mode_critical(struct task_struct *task)
 #endif
 }
 
-static void sched_set_mode_exit(struct task_struct *task)
+static void sched_set_mode_normal(struct task_struct *task)
 {
-    sched_set_normal(task, MAX_NICE);
+    sched_set_normal(task, PRIORITY_NORMAL_VALUE);
 }
 
 static int blocker_thread(void *data)
@@ -225,12 +217,12 @@ static int blocker_thread(void *data)
             local_ctx->lifecycle = KTHREAD_STAT_RUNNING;
             smp_wmb(); /* To prevent out-of-order execution on processor and compiler */
 
-            while (--timeout) {
+            while (timeout) {
                 if (!this->is_busy) {
                     break;
                 }
-
                 udelay(1);
+                timeout--;
             }
 
             local_irq_restore(flags);
@@ -257,7 +249,7 @@ static int blocker_thread(void *data)
 
 exit:
 
-    sched_set_mode_exit(current);
+    sched_set_mode_normal(current);
 
     local_ctx->lifecycle = KTHREAD_STAT_DEAD;
 
@@ -320,6 +312,7 @@ static int worker_thread(void *data)
         while (wait_event_interruptible(this->worker_waitq,
                this->requestor_ctx ||
                kthread_should_stop())) {};
+
         if (kthread_should_stop()) {
             goto exit;
         }
@@ -348,6 +341,7 @@ static int worker_thread(void *data)
             blocker_ctx = &this->kt_ctx[i];
             blocker_ctx->lifecycle = KTHREAD_REQ_START;
         }
+
         wake_up_interruptible_all(&this->blocker_waitq);
 
         /* Critical section begins */
@@ -367,13 +361,13 @@ static int worker_thread(void *data)
 
             blocker_ctx = &this->kt_ctx[i];
 
-            do {
+            while (timeout) {
                 if (blocker_ctx->lifecycle == KTHREAD_STAT_RUNNING) {
                     break;
                 }
-
                 udelay(1);
-            } while (--timeout);
+                timeout--;
+            }
 
             if (!timeout) {
                 break;
@@ -411,7 +405,7 @@ static int worker_thread(void *data)
 
 exit:
 
-    sched_set_mode_exit(current);
+    sched_set_mode_normal(current);
 
     local_ctx->lifecycle = KTHREAD_STAT_DEAD;
 
@@ -523,6 +517,7 @@ static int realtime_session_execute(resource_manager_child_session_context *chil
                                     bool *is_orderly)
 {
     int rc;
+    int cpu_allowed;
     struct session_context *session_ctx = realtime_session_context_cast(child_s_ctx);
     struct this_context *this = session_ctx->parent;
 
@@ -543,25 +538,37 @@ static int realtime_session_execute(resource_manager_child_session_context *chil
      * processed without any interruptions or preemption. The
      * opposite of real-time is time-sharing or time-slicing.
      *
-     * Currently, only the third mode is supported for the sake
+     * Currently, only 2nd & 3rd mode are supported for the sake
      * of simplicity.
      */
     if (!*is_orderly) {
-        /* If execution is not orderly, request for it */
+        /* If execution is not orderly, request for it. */
         *is_orderly = true;
         rc = 0;
         goto out;
     }
 
-    /* At this stage, the execution is orderly. Now, request real-time execution. */
-    this->requestor_ctx = session_ctx;
-    session_ctx->is_busy = true;
-    wake_up_interruptible_all(&this->worker_waitq);
+    /* At this stage, the execution is orderly. */
 
-    while (wait_event_interruptible(session_ctx->waitq, !session_ctx->is_busy)) {};
+    mutex_lock(&this->mutex);
+    cpu_allowed = this->cpu_allowed;
+    mutex_unlock(&this->mutex);
 
-    rc = session_ctx->rc;
-    session_ctx->rc = 0;
+    if (cpu_allowed) {
+        /* Request real-time execution. */
+
+        this->requestor_ctx = session_ctx;
+        session_ctx->is_busy = true;
+        wake_up_interruptible_all(&this->worker_waitq);
+
+        while (wait_event_interruptible(session_ctx->waitq, !session_ctx->is_busy)) {};
+
+        rc = session_ctx->rc;
+        session_ctx->rc = 0;
+    } else {
+        /* Execution without real-time. */
+        rc = this->child_funcs->execute(session_ctx->child_ctx);
+    }
 
 out:
     return rc;
@@ -638,7 +645,7 @@ static ssize_t cpu_allowed_store(struct device *dev, struct device_attribute *at
     sscanf(buf, "%d", &temp);
 
     mutex_lock(&this->mutex);
-    this->cpu_allowed = min_t(int, (temp < 1) ? 1 : temp, this->cpu_max);
+    this->cpu_allowed = min_t(int, (temp < 0) ? 0 : temp, this->cpu_max);
     mutex_unlock(&this->mutex);
     return count;
 }
@@ -792,7 +799,7 @@ static int spawner(struct this_context *this)
         kthread_bind(kt_ctx->task, cpu_id);
 
         /* Set scheduling policy */
-        sched_set_mode_critical(current);
+        sched_set_mode_critical(kt_ctx->task);
     }
 
     /* Launch kthreads */
@@ -890,6 +897,7 @@ void realtime_exit(realtime_context **rt_ctx)
 
         while (wait_event_interruptible(
                *waitq, kt_ctx->lifecycle == KTHREAD_STAT_DEAD)) {};
+
     }
 
     kfree(this->kt_ctx);

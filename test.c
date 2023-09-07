@@ -111,11 +111,10 @@ out_free_fd:
 }
 
 int main() {
+
     if (test(false)) {
         return 1;
     }
-
-    //sleep(1);
 
     if (test(true)) {
         return 1;

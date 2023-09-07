@@ -1,4 +1,5 @@
 obj-m = mod.o
+
 mod-objs += lkm.o
 mod-objs += realtime.o
 mod-objs += resource-manager.o
