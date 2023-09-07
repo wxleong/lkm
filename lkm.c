@@ -30,6 +30,8 @@
  */
 #define pr_fmt(fmt) "%s:%s:%s:%d: " fmt, KBUILD_MODNAME, __FILE__, __func__, __LINE__
 
+#include <linux/init.h>
+#include <linux/module.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include "lkm.h"
