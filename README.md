@@ -58,7 +58,9 @@ Attribute Table:
 | realtime | blocker_timeout | RW | The timeout value for a worker waiting for the blockers to enter the blocking mode.  |
 | realtime | worker_timeout | RW | The timeout value for the blockers waiting for the worker to complete its execution.  |
 | realtime | cpu_max | RO | Number of physical CPU core.  |
-| realtime | cpu_allowed | RW | `0` results in non-real-time execution; `1` ensures real-time execution without hogging other CPU cores; `>1` enables real-time execution while hogging other CPUs up to a maximum of `cpu_max-1` cores.  |
+| realtime | cpu_allowed | RW | `<0` results in non-real-time execution.<br>`0` allows execution to occur in a kthread running with a real-time scheduling policy (e.g., SCHED_FIFO).<br>`1`, in addition to `0`, disables local interrupts but without hogging other CPU cores.<br>`>1`, in addition to `0`, hog other CPUs (and disables local interrupts) up to a maximum of `cpu_max-1` cores. |
 | resource-manager | session_max | RW | Maximum allowed sessions open simultaneously. |
 | resource-manager | session_count | RO | Number of active sessions. |
 > A worker is a single kthread where critical or time-sensitive operations are executed, whereas blockers are multiple kthreads used to hog CPU cores, preventing them from executing other tasks and wait for the worker to complete its execution.
+
+> 'local interrupts' refers to interrupts that are associated with a specific CPU core.

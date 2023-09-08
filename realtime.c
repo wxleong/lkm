@@ -332,45 +332,45 @@ static int worker_thread(void *data)
 
         mutex_unlock(&this->mutex);
 
-        /* Issue start command to blocker threads */
-        for (i = 0; i < cpu_allowed; i++) {
-            if (i == WORKER_CPU_CORE_INDEX) {
-                continue;
+        if (cpu_allowed > 0) {
+            /* Issue start command to blocker threads */
+            for (i = 0; i < cpu_allowed; i++) {
+                if (i == WORKER_CPU_CORE_INDEX) {
+                    continue;
+                }
+
+                blocker_ctx = &this->kt_ctx[i];
+                blocker_ctx->lifecycle = KTHREAD_REQ_START;
             }
 
-            blocker_ctx = &this->kt_ctx[i];
-            blocker_ctx->lifecycle = KTHREAD_REQ_START;
-        }
+            wake_up_interruptible_all(&this->blocker_waitq);
 
-        wake_up_interruptible_all(&this->blocker_waitq);
+            local_irq_save(flags);
+            preempt_disable();
 
-        /* Critical section begins */
+            /*
+             * Wait for the blocker_thread to enter the critical section.
+             * If a timeout occurs while waiting, the process will
+             * proceed regardless.
+             */
+            for (i = 0; i < cpu_allowed; i++) {
+                if (i == WORKER_CPU_CORE_INDEX) {
+                    continue;
+                }
 
-        local_irq_save(flags);
-        preempt_disable();
+                blocker_ctx = &this->kt_ctx[i];
 
-        /*
-         * Wait for the blocker_thread to enter the critical section.
-         * If a timeout occurs while waiting, the process will
-         * proceed regardless.
-         */
-        for (i = 0; i < cpu_allowed; i++) {
-            if (i == WORKER_CPU_CORE_INDEX) {
-                continue;
-            }
+                while (timeout) {
+                    if (blocker_ctx->lifecycle == KTHREAD_STAT_RUNNING) {
+                        break;
+                    }
+                    udelay(1);
+                    timeout--;
+                }
 
-            blocker_ctx = &this->kt_ctx[i];
-
-            while (timeout) {
-                if (blocker_ctx->lifecycle == KTHREAD_STAT_RUNNING) {
+                if (!timeout) {
                     break;
                 }
-                udelay(1);
-                timeout--;
-            }
-
-            if (!timeout) {
-                break;
             }
         }
 
@@ -379,10 +379,10 @@ static int worker_thread(void *data)
         this->is_busy = false;
         smp_wmb(); /* To prevent out-of-order execution on processor and compiler */
 
-        local_irq_restore(flags);
-        preempt_enable();
-
-        /* Critical section ends */
+        if (cpu_allowed > 0) {
+            local_irq_restore(flags);
+            preempt_enable();
+        }
 
         if (!timeout) {
             mutex_lock(&this->mutex);
@@ -554,7 +554,7 @@ static int realtime_session_execute(resource_manager_child_session_context *chil
     cpu_allowed = this->cpu_allowed;
     mutex_unlock(&this->mutex);
 
-    if (cpu_allowed) {
+    if (cpu_allowed >= 0) {
         /* Request real-time execution. */
 
         this->requestor_ctx = session_ctx;
@@ -645,8 +645,9 @@ static ssize_t cpu_allowed_store(struct device *dev, struct device_attribute *at
     sscanf(buf, "%d", &temp);
 
     mutex_lock(&this->mutex);
-    this->cpu_allowed = min_t(int, (temp < 0) ? 0 : temp, this->cpu_max);
+    this->cpu_allowed = min_t(int, temp, this->cpu_max);
     mutex_unlock(&this->mutex);
+
     return count;
 }
 
