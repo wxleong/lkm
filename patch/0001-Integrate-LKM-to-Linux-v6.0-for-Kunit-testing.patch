@@ -1,0 +1,43 @@
+From a34e47fdaf3b5eb859b5f702f7ccf5bdc7197295 Mon Sep 17 00:00:00 2001
+From: "wenxin.leong" <wenxin.leong@infineon.com>
+Date: Tue, 26 Sep 2023 14:21:42 +0800
+Subject: [PATCH] Integrate LKM to Linux v6.0 for Kunit testing
+
+Signed-off-by: wenxin.leong <wenxin.leong@infineon.com>
+---
+ drivers/char/Kconfig  | 10 ++++++++++
+ drivers/char/Makefile |  2 ++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/drivers/char/Kconfig b/drivers/char/Kconfig
+index 0f378d29dab0..86a6cb2bcc88 100644
+--- a/drivers/char/Kconfig
++++ b/drivers/char/Kconfig
+@@ -459,4 +459,14 @@ config RANDOM_TRUST_BOOTLOADER
+ 	  believe its RNG facilities may be faulty. This may also be configured
+ 	  at boot time with "random.trust_bootloader=on/off".
+ 
++config CHARDEV_LKM
++	bool "Build the LKM template"
++	help
++	  A Character Device Linux Kernel Module Template.
++
++config CHARDEV_LKM_TEST
++	tristate "Test for LKM" if !KUNIT_ALL_TESTS
++	depends on CHARDEV_LKM && KUNIT
++	default KUNIT_ALL_TESTS
++
+ endmenu
+diff --git a/drivers/char/Makefile b/drivers/char/Makefile
+index 1b35d1724565..954fd321f6a1 100644
+--- a/drivers/char/Makefile
++++ b/drivers/char/Makefile
+@@ -45,3 +45,5 @@ obj-$(CONFIG_PS3_FLASH)		+= ps3flash.o
+ obj-$(CONFIG_XILLYBUS_CLASS)	+= xillybus/
+ obj-$(CONFIG_POWERNV_OP_PANEL)	+= powernv-op-panel.o
+ obj-$(CONFIG_ADI)		+= adi.o
++
++obj-$(CONFIG_CHARDEV_LKM)		+= lkm/
+-- 
+2.34.1
+

@@ -8,7 +8,7 @@ The kernel module is designed to be non-monolithic with reusability in mind, com
 
 Build:
 ```
-$ make
+$ make CONFIG_CHARDEV_LKM=m
 ```
 
 Insert the kernel module:
@@ -64,3 +64,52 @@ Attribute Table:
 > A worker is a single kthread where critical or time-sensitive operations are executed, whereas blockers are multiple kthreads used to hog CPU cores, preventing them from executing other tasks and wait for the worker to complete its execution.
 
 > 'local interrupts' refers to interrupts that are associated with a specific CPU core.
+
+# KUnit Setup
+
+The objective is to run KUnit in a CI/CD environment, and Docker is used for this purpose. Here are the steps:
+
+First, launch a container:
+```
+$ docker run --name kunit -it -v /dev/shm --tmpfs /dev/shm:rw,exec,size=1G --hostname kunit --env LANG=C.UTF-8 ubuntu:22.04
+```
+
+From this point onwards, execute all commands within the container.
+
+Install the required dependencies:
+```
+$ apt update
+$ apt install -y git python3 gcc make flex bison bc pkg-config libncurses5-dev
+```
+
+Download the Linux kernel source code:
+```
+$ cd ~
+$ git clone https://github.com/torvalds/linux --single-branch -b v6.0
+```
+
+Run the default KUnit tests:
+```
+$ cd ~/linux
+$ ./tools/testing/kunit/kunit.py run
+```
+
+Integrate your project into the Linux kernel source tree:
+```
+$ cd ~/linux/drivers/char
+$ git clone https://github.com/wxleong/lkm
+```
+
+Apply the patch to the kernel source code. This will modify the Makefile and Kconfig to include your project in the tree:
+```
+$ cd ~/linux
+$ git apply ~/linux/drivers/char/lkm/patch/0001-Integrate-LKM-to-Linux-v6.0-for-Kunit-testing.patch
+```
+
+Run the KUnit tests for your project:
+```
+$ cd ~/linux
+$ ./tools/testing/kunit/kunit.py run --kconfig_add CONFIG_CHARDEV_LKM=y --kconfig_add CONFIG_CHARDEV_LKM_TEST=y
+```
+
+These steps set up a Docker container, install the necessary dependencies, download the Linux kernel source code, integrate your project, apply the required patch, and run KUnit tests for your project within the Linux kernel source tree.
